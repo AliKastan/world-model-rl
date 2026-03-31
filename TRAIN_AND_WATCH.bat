@@ -1,5 +1,5 @@
 @echo off
-title AI Learning - PPO Agent
+title RL Training - Watch AI Learn Sokoban
 cd /d "%~dp0"
 
 echo Installing dependencies...
@@ -7,14 +7,15 @@ pip install pygame numpy torch -q 2>nul
 
 echo.
 echo ==========================================
-echo   PPO Agent - Watch AI Learn from Scratch
+echo   Watch AI Learn Sokoban from Scratch!
 echo ==========================================
+echo   The agent starts RANDOM and gets smarter.
+echo.
 echo   Controls:
 echo     Space = Pause/Resume
-echo     F     = Fast mode (skip rendering)
+echo     F     = Fast mode (skip visuals)
 echo     S     = Slow mode (watch every step)
-echo     V     = Visual mode (normal speed)
-echo     1-5   = Change difficulty
+echo     V     = Visual mode (normal)
 echo     ESC   = Quit
 echo ==========================================
 echo.

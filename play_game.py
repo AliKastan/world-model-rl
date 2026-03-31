@@ -1,806 +1,718 @@
 #!/usr/bin/env python3
-"""Standalone playable Sokoban puzzle game with beautiful rendering.
+"""Sokoban -- 60 Levels: a complete Pygame-based Sokoban game.
+
+Uses the project's own env.sokoban and env.level_loader modules.
 
 Controls:
-  Arrow keys / WASD  — Move agent
-  U                  — Undo last move
-  R                  — Restart level
-  N                  — Next level
-  H                  — Show hint (optimal next move)
-  1-5                — Jump to level
-  ESC / Q            — Quit
-
-No project imports needed — fully self-contained (only pygame + numpy).
+    Arrow keys  Move player
+    U           Undo last move
+    R           Restart level
+    N           Next level
+    P           Previous level
+    H           Hint (show best move via BFS solver)
+    ESC         Back to level select
+    Q           Quit
 """
 
 from __future__ import annotations
 
-import copy
+import json
 import math
+import os
 import sys
+import threading
 import time
-from collections import deque
-from dataclasses import dataclass
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import pygame
 
-# ═══════════════════════════════════════════════════════════════════════
-# Constants
-# ═══════════════════════════════════════════════════════════════════════
+from env.sokoban import SokobanState, solve, DIR_DELTAS
+from env.level_loader import LevelLoader
 
-CELL = 64
-FPS = 60
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LEVELS_FILE = os.path.join(BASE_DIR, "levels", "classic_60.txt")
+PROGRESS_FILE = os.path.join(BASE_DIR, "levels", "progress.json")
 
+# ---------------------------------------------------------------------------
 # Colours
+# ---------------------------------------------------------------------------
 BG = (22, 22, 35)
-GRID_LINE = (35, 35, 50)
-C_AGENT = (99, 102, 241)
-C_AGENT_EYE = (255, 255, 255)
-C_BOX = (251, 191, 36)
-C_BOX_DONE = (52, 211, 153)
-C_TARGET = (52, 211, 153)
-C_WALL = (75, 85, 99)
-C_WALL_HI = (90, 100, 114)
-C_WALL_LO = (55, 65, 79)
-C_KEY = (251, 146, 60)
-C_DOOR_LOCKED = (239, 68, 68)
-C_DOOR_OPEN = (74, 222, 128)
-C_FLOOR = (30, 30, 46)
-C_HUD_BG = (15, 15, 25)
-C_HUD_TEXT = (220, 220, 235)
-C_HINT = (99, 102, 241)
-C_DEADLOCK = (239, 68, 68)
-C_GOLD = (251, 191, 36)
-C_DIM = (60, 60, 80)
+WALL_COLOR = (75, 85, 99)
+WALL_LIGHT = (95, 105, 119)
+WALL_DARK = (55, 65, 79)
+FLOOR_LINE = (40, 40, 55)
+BOX_COLOR = (251, 191, 36)
+BOX_ON_TARGET = (52, 211, 153)
+BOX_DEADLOCK = (220, 50, 50)
+TARGET_COLOR = (52, 211, 153)
+PLAYER_COLOR = (99, 102, 241)
+TEXT_COLOR = (230, 230, 240)
+DIM_TEXT = (140, 140, 160)
+GREEN = (52, 211, 153)
+WHITE = (230, 230, 240)
+GRAY = (80, 80, 100)
+HINT_COLOR = (52, 211, 153)
+SOLVED_BANNER_COLOR = (52, 211, 153)
+DEADLOCK_COLOR = (220, 50, 50)
+MENU_BTN_SOLVED_BG = (30, 70, 50)
+MENU_BTN_AVAIL_BG = (35, 35, 55)
+MENU_BTN_LOCKED_BG = (30, 30, 42)
+MENU_BTN_BORDER = (50, 50, 65)
 
-# Type IDs
-FLOOR = 0
-WALL = 1
-BOX = 2
-TARGET = 3
-BOX_ON_TARGET = 4
-KEY = 5
-DOOR_LOCKED = 6
-DOOR_OPEN = 7
-AGENT = 8
+# ---------------------------------------------------------------------------
+# Layout constants
+# ---------------------------------------------------------------------------
+SCREEN_W, SCREEN_H = 960, 720
+FPS = 60
+ANIM_DURATION = 0.15          # seconds for movement lerp
+SOLVED_BANNER_TIME = 2.5      # seconds before auto-advance
+DEADLOCK_FLASH_TIME = 1.0
+HINT_DISPLAY_TIME = 2.0
 
-UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
-DELTAS = {UP: (0, -1), DOWN: (0, 1), LEFT: (-1, 0), RIGHT: (1, 0)}
-DIR_NAMES = {UP: "up", DOWN: "down", LEFT: "left", RIGHT: "right"}
+# Menu grid
+MENU_COLS = 10
+MENU_BTN_W, MENU_BTN_H = 70, 55
+MENU_GAP_X, MENU_GAP_Y = 10, 10
 
-# ═══════════════════════════════════════════════════════════════════════
-# Levels — defined as string grids
-# ═══════════════════════════════════════════════════════════════════════
+# Arrow key -> action index (matches DIR_DELTAS order in env.sokoban)
+KEY_TO_ACTION = {
+    pygame.K_UP: 0,     # (0, -1)
+    pygame.K_DOWN: 1,   # (0,  1)
+    pygame.K_LEFT: 2,   # (-1, 0)
+    pygame.K_RIGHT: 3,  # ( 1, 0)
+}
 
-# Legend:  # wall, . target, $ box, * box-on-target, @ agent, k key, D locked door
-#          + agent-on-target, (space) floor
+ACTION_ARROWS: Dict[int, str] = {0: "\u2191", 1: "\u2193", 2: "\u2190", 3: "\u2192"}
 
-LEVELS = [
-    {
-        "name": "First Push",
-        "grid": [
-            "#######",
-            "#     #",
-            "# .$  #",
-            "#  @  #",
-            "#     #",
-            "#     #",
-            "#######",
-        ],
-        "optimal": 3,
-    },
-    {
-        "name": "Two Boxes",
-        "grid": [
-            "########",
-            "#      #",
-            "# .$ . #",
-            "#  $   #",
-            "#   @  #",
-            "#      #",
-            "#      #",
-            "########",
-        ],
-        "optimal": 11,
-    },
-    {
-        "name": "Corner Trap",
-        "grid": [
-            "#########",
-            "#       #",
-            "# ## .  #",
-            "# #  $  #",
-            "#    $  #",
-            "#  @  . #",
-            "#       #",
-            "#       #",
-            "#########",
-        ],
-        "optimal": 6,
-    },
-    {
-        "name": "Key & Door",
-        "grid": [
-            "########",
-            "#   D  #",
-            "#   #  #",
-            "# k #$.#",
-            "#   #  #",
-            "#  @   #",
-            "#      #",
-            "########",
-        ],
-        "optimal": 20,
-    },
-    {
-        "name": "The Gauntlet",
-        "grid": [
-            "########",
-            "#      #",
-            "# .  $ #",
-            "#   #  #",
-            "# $  . #",
-            "#   #  #",
-            "#  @   #",
-            "########",
-        ],
-        "optimal": 11,
-    },
-]
+# ---------------------------------------------------------------------------
+# Progress persistence
+# ---------------------------------------------------------------------------
+
+def load_progress() -> dict:
+    """Return {"solved": set[int], "best": {level_idx: steps}}."""
+    default: dict = {"solved": set(), "best": {}}
+    if not os.path.isfile(PROGRESS_FILE):
+        return default
+    try:
+        with open(PROGRESS_FILE, "r") as fh:
+            raw = json.load(fh)
+        default["solved"] = set(raw.get("solved", []))
+        default["best"] = {int(k): v for k, v in raw.get("best", {}).items()}
+    except Exception:
+        pass
+    return default
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Game state
-# ═══════════════════════════════════════════════════════════════════════
+def save_progress(solved: set, best: dict) -> None:
+    os.makedirs(os.path.dirname(PROGRESS_FILE) or ".", exist_ok=True)
+    with open(PROGRESS_FILE, "w") as fh:
+        json.dump({"solved": sorted(solved),
+                    "best": {str(k): v for k, v in best.items()}}, fh)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * max(0.0, min(1.0, t))
 
 
-@dataclass
-class GameState:
-    width: int
-    height: int
-    grid: np.ndarray          # (H, W) int — cell types
-    agent: Tuple[int, int]
-    agent_dir: int
-    boxes: Set[Tuple[int, int]]
-    targets: Set[Tuple[int, int]]
-    keys: Set[Tuple[int, int]]
-    doors: Dict[Tuple[int, int], bool]  # pos -> locked
-    inventory: List[int]
-    steps: int
-    solved: bool
+def clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
 
-    def clone(self) -> "GameState":
-        return GameState(
-            width=self.width,
-            height=self.height,
-            grid=self.grid.copy(),
-            agent=self.agent,
-            agent_dir=self.agent_dir,
-            boxes=set(self.boxes),
-            targets=set(self.targets),
-            keys=set(self.keys),
-            doors=dict(self.doors),
-            inventory=list(self.inventory),
-            steps=self.steps,
-            solved=self.solved,
-        )
+# ---------------------------------------------------------------------------
+# Main game class
+# ---------------------------------------------------------------------------
 
+class SokobanGame:
+    """Encapsulates all game state, rendering, and input handling."""
 
-def _parse_level(level_data: dict) -> GameState:
-    """Parse a string-grid level into a GameState."""
-    lines = level_data["grid"]
-    h = len(lines)
-    w = max(len(line) for line in lines)
-    grid = np.full((h, w), FLOOR, dtype=np.int32)
-    agent = (1, 1)
-    boxes: Set[Tuple[int, int]] = set()
-    targets: Set[Tuple[int, int]] = set()
-    keys: Set[Tuple[int, int]] = set()
-    doors: Dict[Tuple[int, int], bool] = {}
-
-    for y, line in enumerate(lines):
-        for x, ch in enumerate(line):
-            if ch == "#":
-                grid[y, x] = WALL
-            elif ch == ".":
-                grid[y, x] = TARGET
-                targets.add((x, y))
-            elif ch == "$":
-                grid[y, x] = BOX
-                boxes.add((x, y))
-            elif ch == "*":
-                grid[y, x] = BOX_ON_TARGET
-                boxes.add((x, y))
-                targets.add((x, y))
-            elif ch == "@":
-                agent = (x, y)
-            elif ch == "+":
-                agent = (x, y)
-                targets.add((x, y))
-            elif ch == "k":
-                grid[y, x] = KEY
-                keys.add((x, y))
-            elif ch == "D":
-                grid[y, x] = DOOR_LOCKED
-                doors[(x, y)] = True
-
-    return GameState(
-        width=w, height=h, grid=grid, agent=agent, agent_dir=DOWN,
-        boxes=boxes, targets=targets, keys=keys, doors=doors,
-        inventory=[], steps=0, solved=False,
-    )
-
-
-def _is_wall(state: GameState, x: int, y: int) -> bool:
-    if x < 0 or x >= state.width or y < 0 or y >= state.height:
-        return True
-    return state.grid[y, x] == WALL
-
-
-def _is_solid(state: GameState, x: int, y: int) -> bool:
-    if _is_wall(state, x, y):
-        return True
-    if (x, y) in state.boxes:
-        return True
-    if (x, y) in state.doors and state.doors[(x, y)]:
-        return True
-    return False
-
-
-def _box_is_deadlocked(state: GameState, bx: int, by: int) -> bool:
-    """Check if a box at (bx, by) is stuck in a corner (not on target)."""
-    if (bx, by) in state.targets:
-        return False
-    u = _is_wall(state, bx, by - 1)
-    d = _is_wall(state, bx, by + 1)
-    l = _is_wall(state, bx - 1, by)
-    r = _is_wall(state, bx + 1, by)
-    return (u and l) or (u and r) or (d and l) or (d and r)
-
-
-def _any_deadlock(state: GameState) -> bool:
-    for bx, by in state.boxes:
-        if (bx, by) not in state.targets and _box_is_deadlocked(state, bx, by):
-            return True
-    return False
-
-
-def _step(state: GameState, action: int) -> Tuple[float, bool]:
-    """Apply action to state in-place. Returns (reward, solved)."""
-    dx, dy = DELTAS[action]
-    state.agent_dir = action
-    ax, ay = state.agent
-    nx, ny = ax + dx, ay + dy
-
-    # Out of bounds
-    if nx < 0 or nx >= state.width or ny < 0 or ny >= state.height:
-        return -0.5, False
-
-    # Wall
-    if state.grid[ny, nx] == WALL:
-        return -0.5, False
-
-    reward = -0.1  # time penalty
-
-    # Locked door
-    if (nx, ny) in state.doors and state.doors[(nx, ny)]:
-        if state.inventory:
-            state.doors[(nx, ny)] = False
-            state.grid[ny, nx] = DOOR_OPEN
-            state.inventory.pop()
-            state.agent = (nx, ny)
-            reward += 5.0
-        else:
-            return -0.5, False
-
-    # Key
-    elif (nx, ny) in state.keys:
-        state.keys.discard((nx, ny))
-        state.grid[ny, nx] = FLOOR
-        state.inventory.append(1)
-        state.agent = (nx, ny)
-        reward += 2.0
-
-    # Box
-    elif (nx, ny) in state.boxes:
-        bx, by = nx + dx, ny + dy
-        if bx < 0 or bx >= state.width or by < 0 or by >= state.height:
-            return -0.5, False
-        if _is_solid(state, bx, by):
-            return -0.5, False
-
-        # Push box
-        state.boxes.discard((nx, ny))
-        state.boxes.add((bx, by))
-
-        # Update grid
-        if (nx, ny) in state.targets:
-            state.grid[ny, nx] = TARGET
-            reward -= 10.0  # left target
-        else:
-            state.grid[ny, nx] = FLOOR
-
-        if (bx, by) in state.targets:
-            state.grid[by, bx] = BOX_ON_TARGET
-            reward += 10.0
-        else:
-            state.grid[by, bx] = BOX
-
-        state.agent = (nx, ny)
-
-    # Normal floor / target / open door
-    else:
-        state.agent = (nx, ny)
-
-    state.steps += 1
-
-    # Check solved
-    if state.targets and all((bx, by) in state.boxes for bx, by in state.targets):
-        state.solved = True
-        reward += 100.0
-
-    return reward, state.solved
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# BFS solver (for hints and optimal count)
-# ═══════════════════════════════════════════════════════════════════════
-
-def _solver_key(state: GameState) -> Tuple:
-    return (state.agent, frozenset(state.boxes), frozenset(state.keys), tuple(sorted(state.doors.items())))
-
-
-def _solve(state: GameState, max_states: int = 200_000) -> Optional[List[int]]:
-    """BFS solver. Returns optimal action list or None."""
-    start = state.clone()
-    if start.solved:
-        return []
-
-    visited: Set = {_solver_key(start)}
-    queue: deque = deque()
-    queue.append((start, []))
-
-    explored = 0
-    while queue and explored < max_states:
-        cur, actions = queue.popleft()
-        explored += 1
-
-        for action in [UP, DOWN, LEFT, RIGHT]:
-            child = cur.clone()
-            _reward, solved = _step(child, action)
-
-            if _any_deadlock(child):
-                continue
-
-            key = _solver_key(child)
-            if key in visited:
-                continue
-            visited.add(key)
-
-            new_actions = actions + [action]
-            if solved:
-                return new_actions
-
-            queue.append((child, new_actions))
-
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Animation state
-# ═══════════════════════════════════════════════════════════════════════
-
-@dataclass
-class AnimState:
-    agent_from: Optional[Tuple[int, int]] = None
-    agent_to: Optional[Tuple[int, int]] = None
-    agent_t: float = 1.0
-    box_from: Optional[Tuple[int, int]] = None
-    box_to: Optional[Tuple[int, int]] = None
-    box_t: float = 1.0
-    solve_t: float = 0.0
-    show_solved: bool = False
-    deadlock_flash: float = 0.0
-    hint_action: Optional[int] = None
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Renderer
-# ═══════════════════════════════════════════════════════════════════════
-
-def _lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * min(max(t, 0.0), 1.0)
-
-
-def _ease_out(t: float) -> float:
-    t = min(max(t, 0.0), 1.0)
-    return 1.0 - (1.0 - t) ** 2
-
-
-class Renderer:
-    def __init__(self, state: GameState) -> None:
-        self.cs = CELL
-        self.hud_h = 48
-        self.inv_h = 36
-        w = state.width * self.cs
-        h = state.height * self.cs + self.hud_h + self.inv_h
+    def __init__(self) -> None:
         pygame.init()
-        self.screen = pygame.display.set_mode((w, h))
-        pygame.display.set_caption("Think Before You Act — Sokoban")
+        self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+        pygame.display.set_caption("Sokoban \u2014 60 Levels")
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("segoeuisemibold", 16)
-        self.font_big = pygame.font.SysFont("segoeuibold", 28)
-        self.font_hud = pygame.font.SysFont("segoeuisemibold", 14)
-        self.anim = AnimState()
-        self.game_time = 0.0
 
-    def resize(self, state: GameState) -> None:
-        w = state.width * self.cs
-        h = state.height * self.cs + self.hud_h + self.inv_h
-        self.screen = pygame.display.set_mode((w, h))
+        # Fonts -- use consolas with fallback
+        family = "consolas"
+        self.font_title = pygame.font.SysFont(family, 36, bold=True)
+        self.font_med = pygame.font.SysFont(family, 22)
+        self.font_sm = pygame.font.SysFont(family, 16)
+        self.font_grid = pygame.font.SysFont(family, 20, bold=True)
+        self.font_hint = pygame.font.SysFont(family, 48, bold=True)
+        self.font_banner = pygame.font.SysFont(family, 52, bold=True)
 
-    def draw(self, state: GameState, level_name: str, optimal: int, level_idx: int) -> None:
-        cs = self.cs
-        dt = self.clock.get_time() / 1000.0
-        self.game_time += dt
+        # Levels
+        self.loader = LevelLoader(LEVELS_FILE)
+        self.total_levels = self.loader.get_total_levels()
 
-        # Advance animations
-        if self.anim.agent_t < 1.0:
-            self.anim.agent_t = min(1.0, self.anim.agent_t + dt / 0.12)
-        if self.anim.box_t < 1.0:
-            self.anim.box_t = min(1.0, self.anim.box_t + dt / 0.14)
-        if self.anim.show_solved:
-            self.anim.solve_t = min(1.0, self.anim.solve_t + dt / 0.5)
-        if self.anim.deadlock_flash > 0:
-            self.anim.deadlock_flash = max(0.0, self.anim.deadlock_flash - dt / 0.8)
+        # Persistent progress
+        prog = load_progress()
+        self.solved_set: set = prog["solved"]
+        self.best_steps: Dict[int, int] = prog["best"]
 
+        # Menu state
+        self.selected_index = 0
+
+        # Game-play state (set properly by load_level)
+        self.level_index = 0
+        self.state: Optional[SokobanState] = None
+        self.undo_stack: List[SokobanState] = []
+        self.steps = 0
+        self.pushes = 0
+
+        # Animation
+        self.anim_start = 0.0
+        self.anim_from: Tuple[float, float] = (0.0, 0.0)
+        self.anim_to: Tuple[float, float] = (0.0, 0.0)
+        self.animating = False
+
+        # Deadlock flash
+        self.deadlock_time = 0.0
+        self.deadlock_active = False
+
+        # Hint
+        self.hint_action: Optional[int] = None
+        self.hint_time = 0.0
+        self.hint_solving = False
+
+        # Solved overlay
+        self.solved_time = 0.0
+        self.solved_active = False
+        self.solved_optimal: Optional[int] = None
+
+        # Scene control
+        self.scene = "menu"  # "menu" | "game"
+        self.running = True
+
+    # ------------------------------------------------------------------
+    # Level management
+    # ------------------------------------------------------------------
+
+    def load_level(self, index: int) -> None:
+        index = clamp(index, 0, self.total_levels - 1)
+        self.level_index = index
+        self.state = self.loader.get_level(index)
+        self.undo_stack.clear()
+        self.steps = 0
+        self.pushes = 0
+        self.deadlock_active = False
+        self.hint_action = None
+        self.hint_solving = False
+        self.solved_active = False
+        self.solved_optimal = None
+        self.animating = False
+        self.scene = "game"
+
+    def restart_level(self) -> None:
+        self.load_level(self.level_index)
+
+    # ------------------------------------------------------------------
+    # Movement + undo
+    # ------------------------------------------------------------------
+
+    def try_move(self, action: int) -> None:
+        if self.state is None or self.animating or self.solved_active:
+            return
+        old_player = self.state.player
+        new_state = self.state.move(action)
+        if new_state is None:
+            return
+
+        self.undo_stack.append(self.state)
+        pushed = (new_state.boxes != self.state.boxes)
+        self.state = new_state
+        self.steps += 1
+        if pushed:
+            self.pushes += 1
+
+        self.hint_action = None
+
+        # Start lerp animation
+        self.anim_from = (float(old_player[0]), float(old_player[1]))
+        self.anim_to = (float(new_state.player[0]), float(new_state.player[1]))
+        self.anim_start = time.time()
+        self.animating = True
+
+        # Check win
+        if new_state.solved:
+            self.solved_active = True
+            self.solved_time = time.time()
+            self.solved_set.add(self.level_index)
+            prev = self.best_steps.get(self.level_index)
+            if prev is None or self.steps < prev:
+                self.best_steps[self.level_index] = self.steps
+            save_progress(self.solved_set, self.best_steps)
+            self._solve_for_optimal()
+        elif new_state.is_deadlocked():
+            self.deadlock_active = True
+            self.deadlock_time = time.time()
+
+    def undo(self) -> None:
+        if not self.undo_stack or self.animating or self.solved_active:
+            return
+        prev = self.undo_stack.pop()
+        # Adjust counters -- we stored the state *before* the move
+        pushed = (self.state is not None and prev.boxes != self.state.boxes)
+        self.state = prev
+        self.steps = max(0, self.steps - 1)
+        if pushed:
+            self.pushes = max(0, self.pushes - 1)
+        self.deadlock_active = False
+        self.hint_action = None
+
+    # ------------------------------------------------------------------
+    # Hint / optimal (threaded solver calls)
+    # ------------------------------------------------------------------
+
+    def request_hint(self) -> None:
+        if self.state is None or self.animating or self.solved_active or self.hint_solving:
+            return
+        self.hint_solving = True
+        snapshot = self.state.clone()
+
+        def _worker() -> None:
+            sol = solve(snapshot, max_states=300_000)
+            if sol and len(sol) > 0:
+                self.hint_action = sol[0]
+                self.hint_time = time.time()
+            self.hint_solving = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _solve_for_optimal(self) -> None:
+        initial = self.loader.get_level(self.level_index)
+
+        def _worker() -> None:
+            sol = solve(initial, max_states=300_000)
+            if sol is not None:
+                self.solved_optimal = len(sol)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Rendering helpers
+    # ------------------------------------------------------------------
+
+    def _cell_size(self, state: SokobanState) -> int:
+        margin_top, margin_bot = 50, 40
+        avail_w = SCREEN_W - 40
+        avail_h = SCREEN_H - margin_top - margin_bot - 10
+        cw = avail_w // max(state.width, 1)
+        ch = avail_h // max(state.height, 1)
+        return min(cw, ch, 64)
+
+    def _grid_origin(self, state: SokobanState, cell: int) -> Tuple[int, int]:
+        gw = state.width * cell
+        gh = state.height * cell
+        ox = (SCREEN_W - gw) // 2
+        oy = 50 + (SCREEN_H - 50 - 40 - gh) // 2
+        return ox, oy
+
+    # ------------------------------------------------------------------
+    # Draw: game screen
+    # ------------------------------------------------------------------
+
+    def draw_game(self) -> None:
+        state = self.state
+        if state is None:
+            return
+
+        now = time.time()
         self.screen.fill(BG)
 
-        oy = self.hud_h  # grid vertical offset
+        cell = self._cell_size(state)
+        ox, oy = self._grid_origin(state, cell)
 
-        # Draw grid
-        for y in range(state.height):
-            for x in range(state.width):
-                rx, ry = x * cs, y * cs + oy
-                tid = state.grid[y, x]
+        # Finish animation if elapsed
+        if self.animating and (now - self.anim_start) >= ANIM_DURATION:
+            self.animating = False
 
-                # Floor
-                pygame.draw.rect(self.screen, C_FLOOR, (rx, ry, cs, cs))
-                # Grid lines
-                pygame.draw.rect(self.screen, GRID_LINE, (rx, ry, cs, cs), 1)
+        # Expire transient overlays
+        if self.deadlock_active and now - self.deadlock_time > DEADLOCK_FLASH_TIME:
+            self.deadlock_active = False
+        if self.hint_action is not None and now - self.hint_time > HINT_DISPLAY_TIME:
+            self.hint_action = None
 
-                # Walls with 3D effect
-                if tid == WALL:
-                    pygame.draw.rect(self.screen, C_WALL, (rx + 2, ry + 2, cs - 4, cs - 4), border_radius=4)
-                    pygame.draw.rect(self.screen, C_WALL_HI, (rx + 2, ry + 2, cs - 4, 3))
-                    pygame.draw.rect(self.screen, C_WALL_LO, (rx + 2, ry + cs - 5, cs - 4, 3))
+        # -- Floor grid lines --
+        for x in range(state.width + 1):
+            px = ox + x * cell
+            pygame.draw.line(self.screen, FLOOR_LINE,
+                             (px, oy), (px, oy + state.height * cell))
+        for y in range(state.height + 1):
+            py = oy + y * cell
+            pygame.draw.line(self.screen, FLOOR_LINE,
+                             (ox, py), (ox + state.width * cell, py))
 
-                # Target — pulsing circles
-                if (x, y) in state.targets and (x, y) not in state.boxes:
-                    pulse = 0.8 + 0.2 * math.sin(self.game_time * 3.0)
-                    r = int(cs * 0.25 * pulse)
-                    cx, cy = rx + cs // 2, ry + cs // 2
-                    pygame.draw.circle(self.screen, C_TARGET, (cx, cy), r + 4, 2)
-                    pygame.draw.circle(self.screen, C_TARGET, (cx, cy), r, 2)
+        # -- Walls with 3-D bevel --
+        for wx, wy in state.walls:
+            rect = pygame.Rect(ox + wx * cell, oy + wy * cell, cell, cell)
+            pygame.draw.rect(self.screen, WALL_COLOR, rect)
+            pygame.draw.line(self.screen, WALL_LIGHT,
+                             rect.topleft, rect.topright, 2)
+            pygame.draw.line(self.screen, WALL_LIGHT,
+                             rect.topleft, rect.bottomleft, 2)
+            pygame.draw.line(self.screen, WALL_DARK,
+                             rect.bottomleft, rect.bottomright, 2)
+            pygame.draw.line(self.screen, WALL_DARK,
+                             rect.topright, rect.bottomright, 2)
 
-                # Key — bobbing
-                if (x, y) in state.keys:
-                    bob = int(3 * math.sin(self.game_time * 2.5))
-                    kx, ky = rx + cs // 2, ry + cs // 2 + bob
-                    # Key shape: circle head + rectangle shaft
-                    pygame.draw.circle(self.screen, C_KEY, (kx, ky - 6), 8)
-                    pygame.draw.circle(self.screen, C_FLOOR, (kx, ky - 6), 4)
-                    pygame.draw.rect(self.screen, C_KEY, (kx - 2, ky - 2, 4, 14))
-                    pygame.draw.rect(self.screen, C_KEY, (kx, ky + 4, 6, 3))
-                    pygame.draw.rect(self.screen, C_KEY, (kx, ky + 9, 4, 3))
+        # -- Targets (pulsing circle) --
+        pulse = 0.6 + 0.4 * math.sin(now * 3.0)
+        target_r = int(cell * 0.18 * pulse + cell * 0.08)
+        for tx, ty in state.targets:
+            if (tx, ty) in state.boxes:
+                continue  # box covers target visually
+            cx = ox + tx * cell + cell // 2
+            cy = oy + ty * cell + cell // 2
+            pygame.draw.circle(self.screen, TARGET_COLOR, (cx, cy), target_r)
+            pygame.draw.circle(self.screen, TARGET_COLOR, (cx, cy),
+                               target_r + 4, width=2)
 
-                # Door
-                if (x, y) in state.doors:
-                    if state.doors[(x, y)]:
-                        pygame.draw.rect(self.screen, C_DOOR_LOCKED, (rx + 4, ry + 4, cs - 8, cs - 8), border_radius=4)
-                        # Padlock
-                        pygame.draw.circle(self.screen, C_HUD_TEXT, (rx + cs // 2, ry + cs // 2 - 4), 8, 2)
-                        pygame.draw.rect(self.screen, C_HUD_TEXT, (rx + cs // 2 - 6, ry + cs // 2, 12, 10), border_radius=2)
-                    else:
-                        s = pygame.Surface((cs - 8, cs - 8), pygame.SRCALPHA)
-                        s.fill((*C_DOOR_OPEN, 100))
-                        self.screen.blit(s, (rx + 4, ry + 4))
-
-        # Draw boxes (may be animating)
+        # -- Boxes --
         for bx, by in state.boxes:
-            if self.anim.box_to == (bx, by) and self.anim.box_t < 1.0:
-                fx, fy = self.anim.box_from
-                t = _ease_out(self.anim.box_t)
-                dx = _lerp(fx * cs, bx * cs, t)
-                dy = _lerp(fy * cs + oy, by * cs + oy, t)
-                # Squash effect
-                sx = 1.0 + 0.15 * (1.0 - t)
-                sy = 1.0 - 0.1 * (1.0 - t)
-            else:
-                dx, dy = bx * cs, by * cs + oy
-                sx, sy = 1.0, 1.0
-
+            rect = pygame.Rect(ox + bx * cell + 3, oy + by * cell + 3,
+                               cell - 6, cell - 6)
             on_target = (bx, by) in state.targets
-            color = C_BOX_DONE if on_target else C_BOX
 
-            bw = int(cs * 0.8 * sx)
-            bh = int(cs * 0.8 * sy)
-            brx = int(dx + (cs - bw) / 2)
-            bry = int(dy + (cs - bh) / 2)
-            pygame.draw.rect(self.screen, color, (brx, bry, bw, bh), border_radius=6)
-
-            # Symbol
-            sym = "\u2713" if on_target else "\u00d7"
-            txt = self.font.render(sym, True, BG)
-            self.screen.blit(txt, (int(dx) + cs // 2 - txt.get_width() // 2,
-                                    int(dy) + cs // 2 - txt.get_height() // 2))
-
-            # Glow outline for on-target
-            if on_target:
-                glow_alpha = int(60 + 40 * math.sin(self.game_time * 4))
-                s = pygame.Surface((bw + 8, bh + 8), pygame.SRCALPHA)
-                pygame.draw.rect(s, (*C_BOX_DONE, glow_alpha), (0, 0, bw + 8, bh + 8), 3, border_radius=8)
-                self.screen.blit(s, (brx - 4, bry - 4))
-
-            # Deadlock flash
-            if self.anim.deadlock_flash > 0 and _box_is_deadlocked(state, bx, by):
-                alpha = int(180 * self.anim.deadlock_flash)
-                s = pygame.Surface((bw, bh), pygame.SRCALPHA)
-                s.fill((*C_DEADLOCK, alpha))
-                self.screen.blit(s, (brx, bry))
-
-        # Draw agent (may be animating)
-        if self.anim.agent_t < 1.0 and self.anim.agent_from and self.anim.agent_to:
-            fx, fy = self.anim.agent_from
-            tx, ty = self.anim.agent_to
-            t = _ease_out(self.anim.agent_t)
-            ax_px = _lerp(fx * cs, tx * cs, t) + cs // 2
-            ay_px = _lerp(fy * cs + oy, ty * cs + oy, t) + cs // 2
-            # Bounce
-            bounce = 3 * math.sin(t * math.pi)
-            ay_px -= bounce
-        else:
-            ax_px = state.agent[0] * cs + cs // 2
-            ay_px = state.agent[1] * cs + oy + cs // 2
-
-        ar = int(cs * 0.38)
-        pygame.draw.circle(self.screen, C_AGENT, (int(ax_px), int(ay_px)), ar)
-
-        # Eyes
-        dx_e, dy_e = DELTAS.get(state.agent_dir, (0, 1))
-        eye_off = ar // 3
-        for side in (-1, 1):
-            if dx_e != 0:
-                ex = int(ax_px + dx_e * eye_off)
-                ey = int(ay_px + side * eye_off * 0.6)
+            # Pick colour
+            if self.deadlock_active and not on_target:
+                w_up = (bx, by - 1) in state.walls
+                w_dn = (bx, by + 1) in state.walls
+                w_lt = (bx - 1, by) in state.walls
+                w_rt = (bx + 1, by) in state.walls
+                if (w_up or w_dn) and (w_lt or w_rt):
+                    color = BOX_DEADLOCK
+                else:
+                    color = BOX_COLOR
+            elif on_target:
+                color = BOX_ON_TARGET
             else:
-                ex = int(ax_px + side * eye_off * 0.6)
-                ey = int(ay_px + dy_e * eye_off)
-            pygame.draw.circle(self.screen, C_AGENT_EYE, (ex, ey), 4)
-            pygame.draw.circle(self.screen, BG, (ex + dx_e * 2, ey + dy_e * 2), 2)
+                color = BOX_COLOR
 
-        # Hint arrow
-        if self.anim.hint_action is not None:
-            hdx, hdy = DELTAS[self.anim.hint_action]
-            hx = state.agent[0] + hdx
-            hy = state.agent[1] + hdy
-            if 0 <= hx < state.width and 0 <= hy < state.height:
-                s = pygame.Surface((cs, cs), pygame.SRCALPHA)
-                s.fill((*C_HINT, 80))
-                self.screen.blit(s, (hx * cs, hy * cs + oy))
-                # Arrow
-                arrow_txt = {UP: "\u2191", DOWN: "\u2193", LEFT: "\u2190", RIGHT: "\u2192"}
-                atxt = self.font_big.render(arrow_txt[self.anim.hint_action], True, (*C_HINT, 200))
-                self.screen.blit(atxt, (hx * cs + cs // 2 - atxt.get_width() // 2,
-                                         hy * cs + oy + cs // 2 - atxt.get_height() // 2))
+            pygame.draw.rect(self.screen, color, rect, border_radius=6)
+            # inner highlight ring
+            inner = pygame.Rect(rect.x + 3, rect.y + 3,
+                                rect.width - 6, rect.height - 6)
+            lighter = tuple(min(255, c + 30) for c in color)
+            pygame.draw.rect(self.screen, lighter, inner, width=1,
+                             border_radius=4)
 
-        # ── HUD ──
-        pygame.draw.rect(self.screen, C_HUD_BG, (0, 0, self.screen.get_width(), self.hud_h))
+        # -- Player (circle with highlight) --
+        if self.animating:
+            t = (now - self.anim_start) / ANIM_DURATION
+            t = max(0.0, min(1.0, t))
+            px = lerp(self.anim_from[0], self.anim_to[0], t)
+            py = lerp(self.anim_from[1], self.anim_to[1], t)
+        else:
+            px, py = float(state.player[0]), float(state.player[1])
 
-        # Level name
-        ltxt = self.font_hud.render(f"Level {level_idx + 1}: {level_name}", True, C_HUD_TEXT)
-        self.screen.blit(ltxt, (10, 6))
+        pcx = ox + int(px * cell) + cell // 2
+        pcy = oy + int(py * cell) + cell // 2
+        player_r = cell // 2 - 4
+        pygame.draw.circle(self.screen, PLAYER_COLOR, (pcx, pcy), player_r)
+        highlight = tuple(min(255, c + 50) for c in PLAYER_COLOR)
+        pygame.draw.circle(self.screen, highlight, (pcx, pcy),
+                           player_r // 2, width=2)
 
-        # Steps
-        stxt = self.font_hud.render(f"Steps: {state.steps}", True, C_HUD_TEXT)
-        self.screen.blit(stxt, (10, 26))
+        # -- Hint arrow overlay --
+        if self.hint_action is not None:
+            dx, dy = DIR_DELTAS[self.hint_action]
+            hx = state.player[0] + dx
+            hy = state.player[1] + dy
+            arrow_cx = ox + hx * cell + cell // 2
+            arrow_cy = oy + hy * cell + cell // 2
+            alpha = 0.5 + 0.5 * math.sin(now * 6.0)
+            a_color = tuple(int(c * alpha) for c in HINT_COLOR)
+            arrow_surf = self.font_hint.render(
+                ACTION_ARROWS[self.hint_action], True, a_color)
+            ar = arrow_surf.get_rect(center=(arrow_cx, arrow_cy))
+            self.screen.blit(arrow_surf, ar)
 
-        # Optimal
-        otxt = self.font_hud.render(f"Optimal: {optimal}", True, C_DIM)
-        self.screen.blit(otxt, (120, 26))
+        # -- HUD top bar --
+        best_str = ""
+        b = self.best_steps.get(self.level_index)
+        if b is not None:
+            best_str = f"  |  Best: {b}"
+        hud = (f"Level {self.level_index + 1}/{self.total_levels}  |  "
+               f"Steps: {self.steps}  |  Pushes: {self.pushes}{best_str}")
+        hud_surf = self.font_med.render(hud, True, TEXT_COLOR)
+        self.screen.blit(hud_surf, (20, 12))
 
-        # Boxes progress
-        boxes_on = sum(1 for b in state.boxes if b in state.targets)
-        total_t = len(state.targets)
-        ptxt = self.font_hud.render(f"Boxes: {boxes_on}/{total_t}", True, C_HUD_TEXT)
-        self.screen.blit(ptxt, (self.screen.get_width() - 120, 6))
+        # Hint-solving indicator
+        if self.hint_solving:
+            s_surf = self.font_sm.render("Solving...", True, HINT_COLOR)
+            self.screen.blit(s_surf, (SCREEN_W - 130, 14))
 
-        # Difficulty stars
-        for i in range(5):
-            sx = self.screen.get_width() - 120 + i * 18
-            color = C_GOLD if i <= level_idx else C_DIM
-            pygame.draw.polygon(self.screen, color, _star_points(sx + 8, 34, 7, 3))
+        # -- Controls bar bottom --
+        controls = ("Arrow=Move  U=Undo  R=Restart  "
+                    "N=Next  P=Prev  H=Hint  ESC=Menu")
+        ctrl_surf = self.font_sm.render(controls, True, DIM_TEXT)
+        self.screen.blit(ctrl_surf,
+                         ((SCREEN_W - ctrl_surf.get_width()) // 2,
+                          SCREEN_H - 28))
 
-        # ── Inventory bar ──
-        inv_y = self.screen.get_height() - self.inv_h
-        pygame.draw.rect(self.screen, C_HUD_BG, (0, inv_y, self.screen.get_width(), self.inv_h))
+        # -- Deadlock text --
+        if self.deadlock_active:
+            dl_surf = self.font_banner.render("DEADLOCK!", True, DEADLOCK_COLOR)
+            dr = dl_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2))
+            backdrop = pygame.Surface((dr.width + 40, dr.height + 20),
+                                      pygame.SRCALPHA)
+            backdrop.fill((0, 0, 0, 160))
+            self.screen.blit(backdrop, (dr.x - 20, dr.y - 10))
+            self.screen.blit(dl_surf, dr)
 
-        if state.inventory:
-            ktxt = self.font_hud.render(f"Keys: {len(state.inventory)}", True, C_KEY)
-            self.screen.blit(ktxt, (10, inv_y + 10))
+        # -- Solved overlay --
+        if self.solved_active:
+            overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 140))
+            self.screen.blit(overlay, (0, 0))
 
-        # Deadlock warning
-        if _any_deadlock(state):
-            wtxt = self.font_hud.render("DEADLOCK!", True, C_DEADLOCK)
-            self.screen.blit(wtxt, (self.screen.get_width() - 100, inv_y + 10))
+            sol_surf = self.font_banner.render("SOLVED!", True,
+                                               SOLVED_BANNER_COLOR)
+            sr = sol_surf.get_rect(center=(SCREEN_W // 2,
+                                           SCREEN_H // 2 - 40))
+            self.screen.blit(sol_surf, sr)
 
-        # ── Solved overlay ──
-        if self.anim.show_solved:
-            t = _ease_out(self.anim.solve_t)
-            s = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
-            s.fill((0, 0, 0, int(140 * t)))
-            self.screen.blit(s, (0, 0))
+            info = f"Steps: {self.steps}  |  Pushes: {self.pushes}"
+            if self.solved_optimal is not None:
+                info += f"  |  Optimal: {self.solved_optimal}"
+            info_surf = self.font_med.render(info, True, TEXT_COLOR)
+            ir = info_surf.get_rect(center=(SCREEN_W // 2,
+                                            SCREEN_H // 2 + 20))
+            self.screen.blit(info_surf, ir)
 
-            stxt = self.font_big.render("SOLVED!", True, C_BOX_DONE)
-            cx = self.screen.get_width() // 2 - stxt.get_width() // 2
-            cy = self.screen.get_height() // 2 - 40
-            self.screen.blit(stxt, (cx, int(cy - 20 * (1 - t))))
+            remaining = SOLVED_BANNER_TIME - (now - self.solved_time)
+            if remaining > 0:
+                cd = self.font_sm.render(
+                    f"Next level in {remaining:.1f}s ...", True, DIM_TEXT)
+                cr = cd.get_rect(center=(SCREEN_W // 2,
+                                         SCREEN_H // 2 + 60))
+                self.screen.blit(cd, cr)
+            else:
+                nxt = self.level_index + 1
+                if nxt < self.total_levels:
+                    self.load_level(nxt)
+                else:
+                    self.scene = "menu"
 
-            eff = (optimal / max(state.steps, 1)) * 100
-            dtxt = self.font.render(
-                f"Steps: {state.steps}  |  Optimal: {optimal}  |  Efficiency: {eff:.0f}%",
-                True, C_HUD_TEXT,
-            )
-            self.screen.blit(dtxt, (self.screen.get_width() // 2 - dtxt.get_width() // 2,
-                                     int(cy + 40 * t)))
+    # ------------------------------------------------------------------
+    # Draw: level-select menu
+    # ------------------------------------------------------------------
 
-            ntxt = self.font_hud.render("Press N for next level, R to retry", True, C_DIM)
-            self.screen.blit(ntxt, (self.screen.get_width() // 2 - ntxt.get_width() // 2,
-                                     int(cy + 70 * t)))
+    def _menu_grid_origin(self) -> Tuple[int, int]:
+        rows = (self.total_levels + MENU_COLS - 1) // MENU_COLS
+        grid_w = (MENU_COLS * MENU_BTN_W
+                  + (MENU_COLS - 1) * MENU_GAP_X)
+        grid_ox = (SCREEN_W - grid_w) // 2
+        grid_oy = 130
+        return grid_ox, grid_oy
 
-        pygame.display.flip()
-        self.clock.tick(FPS)
+    def _max_unlocked(self) -> int:
+        if self.solved_set:
+            return max(self.solved_set) + 1
+        return 0
+
+    def draw_menu(self) -> None:
+        self.screen.fill(BG)
+
+        # Title
+        title = self.font_title.render(
+            "SOKOBAN  \u2014  60 Levels", True, TEXT_COLOR)
+        tr = title.get_rect(center=(SCREEN_W // 2, 50))
+        self.screen.blit(title, tr)
+
+        # Solved counter
+        counter = self.font_med.render(
+            f"Solved: {len(self.solved_set)}/{self.total_levels}",
+            True, GREEN)
+        cr = counter.get_rect(center=(SCREEN_W // 2, 90))
+        self.screen.blit(counter, cr)
+
+        grid_ox, grid_oy = self._menu_grid_origin()
+        max_unlock = self._max_unlocked()
+        mouse_pos = pygame.mouse.get_pos()
+
+        for i in range(self.total_levels):
+            col = i % MENU_COLS
+            row = i // MENU_COLS
+            x = grid_ox + col * (MENU_BTN_W + MENU_GAP_X)
+            y = grid_oy + row * (MENU_BTN_H + MENU_GAP_Y)
+            rect = pygame.Rect(x, y, MENU_BTN_W, MENU_BTN_H)
+
+            is_solved = i in self.solved_set
+            is_available = i <= max_unlock or is_solved
+            is_selected = i == self.selected_index
+            is_hovered = rect.collidepoint(mouse_pos) and is_available
+
+            if is_solved:
+                bg_color = MENU_BTN_SOLVED_BG
+                border = GREEN
+                txt_color = GREEN
+            elif is_available:
+                bg_color = MENU_BTN_AVAIL_BG
+                border = WHITE
+                txt_color = WHITE
+            else:
+                bg_color = MENU_BTN_LOCKED_BG
+                border = GRAY
+                txt_color = GRAY
+
+            pygame.draw.rect(self.screen, bg_color, rect, border_radius=6)
+
+            if is_selected or is_hovered:
+                pygame.draw.rect(self.screen, border, rect,
+                                 width=2, border_radius=6)
+            else:
+                pygame.draw.rect(self.screen, MENU_BTN_BORDER, rect,
+                                 width=1, border_radius=6)
+
+            # Best steps indicator for solved levels
+            if is_solved and i in self.best_steps:
+                tiny = self.font_sm.render(
+                    str(self.best_steps[i]), True,
+                    tuple(max(0, c - 40) for c in GREEN))
+                self.screen.blit(tiny, (rect.right - tiny.get_width() - 4,
+                                        rect.bottom - tiny.get_height() - 2))
+
+            num_surf = self.font_grid.render(str(i + 1), True, txt_color)
+            nr = num_surf.get_rect(center=(rect.centerx, rect.centery - 2))
+            self.screen.blit(num_surf, nr)
+
+        # Instructions
+        instr = ("Arrow keys / Mouse to select  |  "
+                 "Enter / Click to play  |  Q to quit")
+        instr_surf = self.font_sm.render(instr, True, DIM_TEXT)
+        self.screen.blit(instr_surf,
+                         ((SCREEN_W - instr_surf.get_width()) // 2,
+                          SCREEN_H - 28))
+
+    # ------------------------------------------------------------------
+    # Menu hit-test
+    # ------------------------------------------------------------------
+
+    def _menu_hit_test(self, pos: Tuple[int, int]) -> Optional[int]:
+        grid_ox, grid_oy = self._menu_grid_origin()
+        mx, my = pos
+        for i in range(self.total_levels):
+            col = i % MENU_COLS
+            row = i // MENU_COLS
+            x = grid_ox + col * (MENU_BTN_W + MENU_GAP_X)
+            y = grid_oy + row * (MENU_BTN_H + MENU_GAP_Y)
+            if x <= mx <= x + MENU_BTN_W and y <= my <= y + MENU_BTN_H:
+                return i
+        return None
+
+    def _try_enter_level(self, idx: int) -> None:
+        max_unlock = self._max_unlocked()
+        if idx <= max_unlock or idx in self.solved_set:
+            self.load_level(idx)
+
+    # ------------------------------------------------------------------
+    # Event handling: menu
+    # ------------------------------------------------------------------
+
+    def handle_menu_events(self, events: list) -> None:
+        for ev in events:
+            if ev.type == pygame.QUIT:
+                self.running = False
+                return
+
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_q:
+                    self.running = False
+                    return
+                elif ev.key == pygame.K_RIGHT:
+                    self.selected_index = min(self.selected_index + 1,
+                                              self.total_levels - 1)
+                elif ev.key == pygame.K_LEFT:
+                    self.selected_index = max(self.selected_index - 1, 0)
+                elif ev.key == pygame.K_DOWN:
+                    nxt = self.selected_index + MENU_COLS
+                    if nxt < self.total_levels:
+                        self.selected_index = nxt
+                elif ev.key == pygame.K_UP:
+                    nxt = self.selected_index - MENU_COLS
+                    if nxt >= 0:
+                        self.selected_index = nxt
+                elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self._try_enter_level(self.selected_index)
+
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                idx = self._menu_hit_test(ev.pos)
+                if idx is not None:
+                    self.selected_index = idx
+                    self._try_enter_level(idx)
+
+    # ------------------------------------------------------------------
+    # Event handling: game
+    # ------------------------------------------------------------------
+
+    def handle_game_events(self, events: list) -> None:
+        for ev in events:
+            if ev.type == pygame.QUIT:
+                self.running = False
+                return
+
+            if ev.type != pygame.KEYDOWN:
+                continue
+
+            if ev.key == pygame.K_q:
+                self.running = False
+                return
+            elif ev.key == pygame.K_ESCAPE:
+                self.scene = "menu"
+                return
+            elif ev.key in KEY_TO_ACTION:
+                self.try_move(KEY_TO_ACTION[ev.key])
+            elif ev.key == pygame.K_u:
+                self.undo()
+            elif ev.key == pygame.K_r:
+                self.restart_level()
+            elif ev.key == pygame.K_n:
+                nxt = self.level_index + 1
+                if nxt < self.total_levels:
+                    self.load_level(nxt)
+            elif ev.key == pygame.K_p:
+                prv = self.level_index - 1
+                if prv >= 0:
+                    self.load_level(prv)
+            elif ev.key == pygame.K_h:
+                self.request_hint()
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        while self.running:
+            events = pygame.event.get()
+
+            if self.scene == "menu":
+                self.handle_menu_events(events)
+                if self.running:
+                    self.draw_menu()
+            elif self.scene == "game":
+                self.handle_game_events(events)
+                if self.running:
+                    self.draw_game()
+
+            pygame.display.flip()
+            self.clock.tick(FPS)
+
+        pygame.quit()
 
 
-def _star_points(cx: int, cy: int, r_out: int, r_in: int) -> List[Tuple[int, int]]:
-    points = []
-    for i in range(10):
-        angle = math.pi / 2 + i * math.pi / 5
-        r = r_out if i % 2 == 0 else r_in
-        points.append((int(cx + r * math.cos(angle)), int(cy - r * math.sin(angle))))
-    return points
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Main game loop
-# ═══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    level_idx = 0
-    state = _parse_level(LEVELS[level_idx])
-    renderer = Renderer(state)
-    undo_stack: List[GameState] = []
-    solution_cache: Dict[int, Optional[List[int]]] = {}
-
-    running = True
-    while running:
-        level = LEVELS[level_idx]
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-                break
-
-            if event.type == pygame.KEYDOWN:
-                key = event.key
-
-                # Quit
-                if key in (pygame.K_ESCAPE, pygame.K_q):
-                    running = False
-                    break
-
-                # Level select
-                if key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5):
-                    new_idx = key - pygame.K_1
-                    if new_idx < len(LEVELS):
-                        level_idx = new_idx
-                        state = _parse_level(LEVELS[level_idx])
-                        renderer.resize(state)
-                        renderer.anim = AnimState()
-                        undo_stack.clear()
-                    continue
-
-                # Restart
-                if key == pygame.K_r:
-                    state = _parse_level(LEVELS[level_idx])
-                    renderer.resize(state)
-                    renderer.anim = AnimState()
-                    undo_stack.clear()
-                    continue
-
-                # Next level
-                if key == pygame.K_n:
-                    level_idx = (level_idx + 1) % len(LEVELS)
-                    state = _parse_level(LEVELS[level_idx])
-                    renderer.resize(state)
-                    renderer.anim = AnimState()
-                    undo_stack.clear()
-                    continue
-
-                # Undo
-                if key == pygame.K_u and undo_stack:
-                    state = undo_stack.pop()
-                    renderer.anim = AnimState()
-                    continue
-
-                # Hint
-                if key == pygame.K_h:
-                    if level_idx not in solution_cache:
-                        solution_cache[level_idx] = _solve(state)
-                    sol = solution_cache.get(level_idx)
-                    # Re-solve from current state
-                    sol = _solve(state, max_states=100_000)
-                    if sol:
-                        renderer.anim.hint_action = sol[0]
-                    else:
-                        renderer.anim.hint_action = None
-                    continue
-
-                # Movement
-                action = None
-                if key in (pygame.K_UP, pygame.K_w):
-                    action = UP
-                elif key in (pygame.K_DOWN, pygame.K_s):
-                    action = DOWN
-                elif key in (pygame.K_LEFT, pygame.K_a):
-                    action = LEFT
-                elif key in (pygame.K_RIGHT, pygame.K_d):
-                    action = RIGHT
-
-                if action is not None and not state.solved:
-                    renderer.anim.hint_action = None
-                    old_agent = state.agent
-                    old_boxes = set(state.boxes)
-                    undo_stack.append(state.clone())
-
-                    reward, solved = _step(state, action)
-
-                    # Animate agent
-                    if state.agent != old_agent:
-                        renderer.anim.agent_from = old_agent
-                        renderer.anim.agent_to = state.agent
-                        renderer.anim.agent_t = 0.0
-
-                    # Animate box push
-                    moved_boxes = state.boxes - old_boxes
-                    if moved_boxes:
-                        new_pos = moved_boxes.pop()
-                        # Find which old box moved
-                        removed = old_boxes - state.boxes
-                        if removed:
-                            old_pos = removed.pop()
-                            renderer.anim.box_from = old_pos
-                            renderer.anim.box_to = new_pos
-                            renderer.anim.box_t = 0.0
-
-                    # Deadlock flash
-                    if _any_deadlock(state):
-                        renderer.anim.deadlock_flash = 1.0
-
-                    # Solved
-                    if solved:
-                        renderer.anim.show_solved = True
-                        renderer.anim.solve_t = 0.0
-
-                    # Invalidate hint cache
-                    solution_cache.pop(level_idx, None)
-
-        renderer.draw(state, level["name"], level["optimal"], level_idx)
-
-    pygame.quit()
-    sys.exit(0)
+    game = SokobanGame()
+    game.run()
 
 
 if __name__ == "__main__":

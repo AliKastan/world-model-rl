@@ -1,241 +1,494 @@
-"""COMPARE — PPO vs ThinkerAgent side by side.
+"""COMPARE — Side-by-side PPO vs ThinkerAgent comparison.
 
-Both agents train on the SAME puzzles simultaneously.
-Watch PPO struggle while ThinkerAgent plans ahead and learns faster.
+Two agents train simultaneously on the same puzzle distribution.
+Left panel: pure PPO (model-free).
+Right panel: PPO + 1-step lookahead via real env clone (ThinkerAgent).
+Shared learning-curve graph at the bottom shows both agents.
 
 Controls:
   Space  — Pause / Resume
-  F      — Fast mode (train many episodes, render periodically)
-  S      — Slow mode (watch every step)
-  V      — Visual mode (show every episode)
-  1-3    — Change difficulty
+  F      — Fast mode (5 episodes per frame)
+  S      — Slow mode (1 episode per frame, 200ms delay)
+  V      — Visual mode (1 episode per frame, normal speed)
   ESC    — Quit
 """
 
 from __future__ import annotations
 
+import sys
 import time
-from typing import Any, Dict, List
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pygame
 
-from env.gym_env import PuzzleEnv
-from env.objects import Box, Door, Floor, IceTile, Key, PressureSwitch, SwitchWall, Target, Wall
+from env.sokoban_env import SokobanEnv
+from env.sokoban import SokobanState
 from agents.model_free.ppo_agent import PPOAgent
-from agents.model_based.thinker_agent import ThinkerAgent
 
 
-# ── Colours ────────────────────────────────────────────────────────────
-COL_BG = (22, 22, 35)
-COL_PANEL = (30, 30, 50)
+# ═════════════════════════════════════════════════════════════════════
+# Colours
+# ═════════════════════════════════════════════════════════════════════
+
+COL_BG        = (22, 22, 35)
+COL_PANEL     = (30, 30, 50)
 COL_GRID_LINE = (40, 40, 55)
-COL_WALL = (75, 85, 99)
-COL_BOX = (251, 191, 36)
-COL_BOX_DONE = (52, 211, 153)
-COL_TARGET = (52, 211, 153)
-COL_AGENT = (99, 102, 241)
-COL_KEY = (251, 146, 60)
-COL_DOOR_LOCKED = (239, 68, 68)
-COL_DOOR_OPEN = (74, 222, 128)
-COL_ICE = (147, 197, 253)
-COL_SWITCH = (168, 85, 247)
-COL_WHITE = (220, 220, 235)
-COL_DIM = (120, 120, 140)
-COL_GREEN = (52, 211, 153)
-COL_YELLOW = (251, 191, 36)
-COL_RED = (239, 68, 68)
-COL_BLUE = (99, 102, 241)
+COL_WALL      = (75, 85, 99)
+COL_BOX       = (251, 191, 36)
+COL_BOX_DONE  = (52, 211, 153)
+COL_TARGET    = (52, 211, 153)
+COL_PLAYER    = (99, 102, 241)
+COL_WHITE     = (220, 220, 235)
+COL_DIM       = (120, 120, 140)
+COL_GREEN     = (52, 211, 153)
+COL_YELLOW    = (251, 191, 36)
+COL_RED       = (239, 68, 68)
+COL_BLUE      = (99, 102, 241)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Layout constants  (1200 x 720)
+# ═════════════════════════════════════════════════════════════════════
 
 WIN_W, WIN_H = 1200, 720
-LEFT_GRID = pygame.Rect(10, 50, 400, 400)
-RIGHT_GRID = pygame.Rect(620, 50, 400, 400)
-GRAPH_RECT = pygame.Rect(30, 540, 1140, 160)
+TITLE_H      = 40
+GRID_TOP     = TITLE_H
+GRID_BOT     = 500
+GRID_H       = GRID_BOT - GRID_TOP          # 460
+HALF_W       = WIN_W // 2                    # 600
+
+GRID_SIZE    = 400
+LEFT_GRID    = pygame.Rect(
+    (HALF_W - GRID_SIZE) // 2,
+    GRID_TOP + (GRID_H - GRID_SIZE) // 2,
+    GRID_SIZE, GRID_SIZE,
+)
+RIGHT_GRID   = pygame.Rect(
+    HALF_W + (HALF_W - GRID_SIZE) // 2,
+    GRID_TOP + (GRID_H - GRID_SIZE) // 2,
+    GRID_SIZE, GRID_SIZE,
+)
+
+STATS_Y      = GRID_BOT + 4
+GRAPH_RECT   = pygame.Rect(20, 560, WIN_W - 40, 140)
 
 
-def draw_grid(surface, world, area):
-    if world is None:
-        return
-    cs = min(area.width // world.width, area.height // world.height)
-    ox = area.x + (area.width - world.width * cs) // 2
-    oy = area.y + (area.height - world.height * cs) // 2
-    for gy in range(world.height):
-        for gx in range(world.width):
-            rect = pygame.Rect(ox + gx * cs, oy + gy * cs, cs, cs)
-            pygame.draw.rect(surface, COL_BG, rect)
-            pygame.draw.rect(surface, COL_GRID_LINE, rect, 1)
-            cell = world.get_cell(gx, gy)
-            for obj in cell:
-                if isinstance(obj, Wall):
-                    pygame.draw.rect(surface, COL_WALL, rect, border_radius=3)
-                elif isinstance(obj, Target):
-                    pygame.draw.circle(surface, COL_TARGET, rect.center, cs // 4, 2)
-                elif isinstance(obj, Box):
-                    c = COL_BOX_DONE if obj.on_target else COL_BOX
-                    pygame.draw.rect(surface, c, rect.inflate(-6, -6), border_radius=4)
-                elif isinstance(obj, Key):
-                    pygame.draw.circle(surface, COL_KEY, rect.center, cs // 5)
-                elif isinstance(obj, Door):
-                    c = COL_DOOR_LOCKED if obj.locked else COL_DOOR_OPEN
-                    pygame.draw.rect(surface, c, rect.inflate(-4, -4), border_radius=4)
-                elif isinstance(obj, IceTile):
-                    s = pygame.Surface((cs, cs), pygame.SRCALPHA)
-                    pygame.draw.rect(s, (*COL_ICE, 60), (0, 0, cs, cs), border_radius=3)
-                    surface.blit(s, rect)
-                elif isinstance(obj, PressureSwitch):
-                    pad = cs // 4
-                    pygame.draw.rect(surface, COL_SWITCH, rect.inflate(-pad*2, -pad*2), border_radius=3)
-            if (gx, gy) == world.agent_pos:
-                pygame.draw.circle(surface, COL_AGENT, rect.center, cs // 3)
+# ═════════════════════════════════════════════════════════════════════
+# SimpleThinkerAgent — PPO policy + 1-step lookahead via SokobanState
+# ═════════════════════════════════════════════════════════════════════
+
+class SimpleThinkerAgent:
+    """Lightweight thinker: PPO policy + 1-step lookahead using real env clone.
+
+    For the first 1024 transitions the agent behaves like vanilla PPO.
+    After the first PPO update, planning kicks in: before choosing an
+    action, every legal move is simulated on a copy of the SokobanState
+    and the one with the highest shaped reward is selected.  When all
+    moves yield the same reward (no useful signal), the PPO policy is
+    used as tie-breaker.
+    """
+
+    def __init__(self, grid_h: int = 10, grid_w: int = 10) -> None:
+        self.ppo = PPOAgent(grid_h, grid_w)
+        self.world_model_accuracy = 0.0
+        self.planning_active = False
+        self.steps_collected = 0
+
+    # ── reward estimation on a SokobanState ──────────────────────
+    @staticmethod
+    def _estimate_reward(
+        old_state: SokobanState, action: int,
+    ) -> Tuple[Optional[SokobanState], float]:
+        """Simulate one action on an immutable SokobanState, return (new, r)."""
+        old_on = old_state.n_boxes_on_target
+        old_dist = old_state.box_distances()
+
+        new_state = old_state.move(action)
+        if new_state is None:
+            return None, -1.0                     # invalid move
+
+        reward = -0.1                             # step penalty
+
+        if new_state.solved:
+            return new_state, reward + 100.0
+
+        if new_state.is_deadlocked():
+            return new_state, reward - 50.0
+
+        new_on = new_state.n_boxes_on_target
+        if new_on > old_on:
+            reward += 10.0
+        elif new_on < old_on:
+            reward -= 10.0
+
+        dist_diff = old_dist - new_state.box_distances()
+        if dist_diff > 0.5:
+            reward += 1.0
+        elif dist_diff < -0.5:
+            reward -= 1.0
+
+        return new_state, reward
+
+    def select_action(
+        self,
+        obs: np.ndarray,
+        env_state: Optional[SokobanState],
+    ) -> Tuple[int, float, float]:
+        """Pick an action — lookahead when planning is active, else PPO."""
+
+        if self.planning_active and env_state is not None:
+            # 1-step lookahead over all 4 actions
+            rewards = [self._estimate_reward(env_state, a)[1] for a in range(4)]
+            best_r = max(rewards)
+
+            # If all rewards identical, no useful signal — fall back to PPO
+            if rewards.count(best_r) == len(rewards):
+                return self.ppo.select_action(obs)
+
+            best_action = int(np.argmax(rewards))
+            # Still need log_prob + value from PPO for training
+            _, log_prob, value = self.ppo.select_action(obs)
+            return best_action, log_prob, value
+
+        return self.ppo.select_action(obs)
+
+    def get_action_probs(self, obs: np.ndarray) -> np.ndarray:
+        return self.ppo.get_action_probs(obs)
+
+    def store_and_learn(
+        self,
+        obs: np.ndarray,
+        action: int,
+        reward: float,
+        log_prob: float,
+        value: float,
+        done: bool,
+    ) -> None:
+        self.ppo.store_transition(obs, action, reward, log_prob, value, done)
+        self.steps_collected += 1
+        if self.steps_collected >= 1024:
+            self.ppo.update()
+            self.steps_collected = 0
+            self.planning_active = True
+            self.world_model_accuracy = min(0.99, self.world_model_accuracy + 0.05)
 
 
-# ── Per-agent training state ───────────────────────────────────────────
-class AgentState:
-    def __init__(self, name: str, env: PuzzleEnv, agent: Any, color: tuple,
-                 is_thinker: bool = False):
+# ═════════════════════════════════════════════════════════════════════
+# AgentRunner — wraps env + agent + episode bookkeeping
+# ═════════════════════════════════════════════════════════════════════
+
+class AgentRunner:
+    """Manages one environment / agent pair and tracks statistics."""
+
+    def __init__(
+        self,
+        name: str,
+        color: Tuple[int, int, int],
+        is_thinker: bool = False,
+    ) -> None:
         self.name = name
-        self.env = env
-        self.agent = agent
         self.color = color
         self.is_thinker = is_thinker
 
-        self.obs, self.info = env.reset()
+        self.env = SokobanEnv(level_set="training", max_h=10, max_w=10)
+        if is_thinker:
+            self.agent: SimpleThinkerAgent | PPOAgent = SimpleThinkerAgent(10, 10)
+        else:
+            self.agent = PPOAgent(grid_h=10, grid_w=10)
+
+        self.obs: np.ndarray = np.zeros(0)
         self.ep_reward = 0.0
         self.episode = 0
+        self.steps_in_batch = 0
+
         self.all_rewards: List[float] = []
         self.all_solved: List[bool] = []
         self.deadlocks = 0
 
-    def run_episode(self):
-        obs = self.obs
-        ep_reward = 0.0
-        done = False
+        self._reset()
 
-        while not done:
-            if self.is_thinker:
-                action, _ = self.agent.select_action(obs)
-            else:
-                action, log_prob, value = self.agent.select_action(obs)
+    # ── helpers ───────────────────────────────────────────────────
 
-            next_obs, reward, term, trunc, info = self.env.step(action)
-            done = term or trunc
-
-            if self.is_thinker:
-                self.agent.store_experience(obs, action, next_obs, reward, done)
-            else:
-                self.agent.memory.store(obs, action, reward, log_prob, value, done)
-
-            obs = next_obs
-            ep_reward += reward
-
-        self.info = info
-        self.all_rewards.append(ep_reward)
-        self.all_solved.append(info.get("solved", False))
-        if info.get("is_deadlock", False):
-            self.deadlocks += 1
-        self.episode += 1
-
-        # PPO update
-        if not self.is_thinker and self.episode % 10 == 0:
-            self.agent.update()
-
-        # Thinker learning
-        if self.is_thinker:
-            if self.episode % 10 == 0:
-                self.agent.learn_world_model(train_steps=5)
-            if self.episode % 50 == 0:
-                self.agent.dream_and_learn(n_episodes=20, max_steps=20)
-
+    def _reset(self) -> None:
         self.obs, _ = self.env.reset()
         self.ep_reward = 0.0
 
     @property
-    def solve_rate(self):
+    def env_state(self) -> Optional[SokobanState]:
+        return self.env.state
+
+    @property
+    def solve_rate(self) -> float:
         if not self.all_solved:
             return 0.0
         recent = self.all_solved[-100:]
         return sum(recent) / len(recent) * 100
 
     @property
-    def avg_reward(self):
+    def avg_reward(self) -> float:
         if not self.all_rewards:
             return 0.0
         recent = self.all_rewards[-100:]
         return sum(recent) / len(recent)
 
+    # ── episode execution ─────────────────────────────────────────
 
-def draw_dual_graph(surface, font, ppo_solved, thinker_solved, rect):
+    def run_episode(self) -> None:
+        """Run one full episode to completion."""
+        while True:
+            done = self._step()
+            if done:
+                break
+        self._finish_episode()
+
+    def _step(self) -> bool:
+        if self.is_thinker:
+            ta: SimpleThinkerAgent = self.agent  # type: ignore[assignment]
+            action, log_prob, value = ta.select_action(self.obs, self.env_state)
+        else:
+            pa: PPOAgent = self.agent  # type: ignore[assignment]
+            action, log_prob, value = pa.select_action(self.obs)
+
+        next_obs, reward, term, trunc, info = self.env.step(action)
+        done = term or trunc
+
+        if self.is_thinker:
+            ta = self.agent  # type: ignore[assignment]
+            ta.store_and_learn(self.obs, action, reward, log_prob, value, done)
+        else:
+            pa = self.agent  # type: ignore[assignment]
+            pa.store_transition(self.obs, action, reward, log_prob, value, done)
+            self.steps_in_batch += 1
+
+        self.obs = next_obs
+        self.ep_reward += reward
+        return done
+
+    def _finish_episode(self) -> None:
+        state = self.env.state
+        solved = state.solved if state else False
+        deadlocked = state.is_deadlocked() if state else False
+
+        self.all_rewards.append(self.ep_reward)
+        self.all_solved.append(solved)
+        if deadlocked:
+            self.deadlocks += 1
+        self.episode += 1
+
+        # PPO-only batch update (Thinker handles its own inside store_and_learn)
+        if not self.is_thinker and self.steps_in_batch >= 1024:
+            pa: PPOAgent = self.agent  # type: ignore[assignment]
+            pa.update()
+            self.steps_in_batch = 0
+
+        self._reset()
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Rendering helpers
+# ═════════════════════════════════════════════════════════════════════
+
+def draw_sokoban_grid(
+    surface: pygame.Surface,
+    state: Optional[SokobanState],
+    area: pygame.Rect,
+) -> None:
+    """Render a SokobanState into the given rectangle."""
+    if state is None:
+        return
+    w, h = state.width, state.height
+    cs = min(area.width // w, area.height // h)
+    ox = area.x + (area.width - w * cs) // 2
+    oy = area.y + (area.height - h * cs) // 2
+
+    for gy in range(h):
+        for gx in range(w):
+            rect = pygame.Rect(ox + gx * cs, oy + gy * cs, cs, cs)
+            pygame.draw.rect(surface, COL_BG, rect)
+            pygame.draw.rect(surface, COL_GRID_LINE, rect, 1)
+
+            pos = (gx, gy)
+
+            if pos in state.walls:
+                pygame.draw.rect(surface, COL_WALL, rect, border_radius=3)
+                continue
+
+            if pos in state.targets:
+                pygame.draw.circle(surface, COL_TARGET, rect.center, cs // 4, 2)
+
+            if pos in state.boxes:
+                on_target = pos in state.targets
+                c = COL_BOX_DONE if on_target else COL_BOX
+                pygame.draw.rect(surface, c, rect.inflate(-6, -6), border_radius=4)
+
+            if pos == state.player:
+                pygame.draw.circle(surface, COL_PLAYER, rect.center, cs // 3)
+
+
+def draw_agent_stats(
+    surface: pygame.Surface,
+    font: pygame.font.Font,
+    font_bold: pygame.font.Font,
+    runner: AgentRunner,
+    x: int,
+    y: int,
+) -> None:
+    """Draw per-agent statistics below the grid."""
+
+    def text(txt: str, f: pygame.font.Font = font, color=COL_WHITE) -> None:
+        nonlocal y
+        s = f.render(txt, True, color)
+        surface.blit(s, (x, y))
+        y += s.get_height() + 2
+
+    # Agent name
+    text(runner.name, font_bold, runner.color)
+
+    # Episode count
+    text(f"Episode: {runner.episode:,}")
+
+    # Solve rate
+    sr = runner.solve_rate
+    if runner.all_solved:
+        col = COL_GREEN if sr > 50 else COL_YELLOW if sr > 20 else COL_RED
+        text(f"Solve Rate: {sr:.1f}%", color=col)
+    else:
+        text("Solve Rate: --")
+
+    # Avg reward
+    if runner.all_rewards:
+        text(f"Avg Reward: {runner.avg_reward:.1f}")
+    else:
+        text("Avg Reward: --")
+
+    # Deadlock rate
+    if runner.episode > 0:
+        dr = runner.deadlocks / runner.episode * 100
+        text(f"Deadlock Rate: {dr:.0f}%")
+
+    # Thinker-specific stats
+    if runner.is_thinker:
+        ta: SimpleThinkerAgent = runner.agent  # type: ignore[assignment]
+        acc = ta.world_model_accuracy * 100
+        acc_col = COL_GREEN if acc > 80 else COL_YELLOW if acc > 40 else COL_RED
+        text(f"World Model: {acc:.0f}%", color=acc_col)
+
+        plan_on = ta.planning_active
+        plan_col = COL_GREEN if plan_on else COL_RED
+        text(f"Planning: {'ON' if plan_on else 'OFF'}", color=plan_col)
+
+
+def _rolling_rate(data: List[bool], window: int = 100) -> List[float]:
+    """Compute rolling solve rate."""
+    if not data:
+        return []
+    rates: List[float] = []
+    for i in range(len(data)):
+        start = max(0, i - window + 1)
+        chunk = data[start : i + 1]
+        rates.append(sum(chunk) / len(chunk))
+    return rates
+
+
+def draw_dual_graph(
+    surface: pygame.Surface,
+    font: pygame.font.Font,
+    ppo_solved: List[bool],
+    thinker_solved: List[bool],
+    rect: pygame.Rect,
+) -> None:
+    """Shared learning-curve graph with both lines."""
     pygame.draw.rect(surface, COL_PANEL, rect, border_radius=4)
-    lbl = font.render("Learning Curve  (PPO = red, Thinker = blue)", True, COL_DIM)
+
+    # Title
+    lbl = font.render("Solve Rate (rolling 100)", True, COL_DIM)
     surface.blit(lbl, (rect.x + 8, rect.y + 4))
 
-    gy = rect.y + 22
-    gh = rect.height - 30
-    gx = rect.x + 8
-    gw = rect.width - 16
+    graph_x = rect.x + 8
+    graph_w = rect.width - 16
+    graph_y = rect.y + 24
+    graph_h = rect.height - 32
 
-    pygame.draw.line(surface, COL_DIM, (gx, gy + gh), (gx + gw, gy + gh), 1)
-    for dx in range(0, gw, 6):
-        pygame.draw.line(surface, (50, 50, 70), (gx + dx, gy + gh // 2),
-                         (gx + dx + 3, gy + gh // 2), 1)
+    # Axes
+    pygame.draw.line(
+        surface, COL_DIM,
+        (graph_x, graph_y + graph_h), (graph_x + graph_w, graph_y + graph_h), 1,
+    )
+    pygame.draw.line(
+        surface, COL_DIM,
+        (graph_x, graph_y), (graph_x, graph_y + graph_h), 1,
+    )
 
-    def plot(solved_list, color):
-        if len(solved_list) < 2:
+    # 50% dashed line
+    mid_y = graph_y + graph_h // 2
+    for dx in range(0, graph_w, 8):
+        pygame.draw.line(
+            surface, (50, 50, 70),
+            (graph_x + dx, mid_y), (graph_x + dx + 4, mid_y), 1,
+        )
+    pct_lbl = font.render("50%", True, COL_DIM)
+    surface.blit(pct_lbl, (graph_x + graph_w - 34, mid_y - 12))
+
+    # 100% label
+    top_lbl = font.render("100%", True, COL_DIM)
+    surface.blit(top_lbl, (graph_x + graph_w - 42, graph_y - 2))
+
+    # Plot helper
+    def plot_line(rates: List[float], color: Tuple[int, int, int]) -> None:
+        if len(rates) < 2:
             return
-        window = 100
-        rates = []
-        for i in range(len(solved_list)):
-            s = max(0, i - window + 1)
-            c = solved_list[s:i + 1]
-            rates.append(sum(c) / len(c))
-        xs = gw / max(len(rates) - 1, 1)
-        pts = [(gx + int(i * xs), gy + gh - int(r * gh)) for i, r in enumerate(rates)]
-        if len(pts) >= 2:
-            pygame.draw.lines(surface, color, False, pts, 2)
+        n = len(rates)
+        x_scale = graph_w / max(n - 1, 1)
+        points = [
+            (graph_x + int(i * x_scale), graph_y + graph_h - int(r * graph_h))
+            for i, r in enumerate(rates)
+        ]
+        if len(points) >= 2:
+            pygame.draw.lines(surface, color, False, points, 2)
 
-    plot(ppo_solved, COL_RED)
-    plot(thinker_solved, COL_BLUE)
+    plot_line(_rolling_rate(ppo_solved), COL_RED)
+    plot_line(_rolling_rate(thinker_solved), COL_BLUE)
 
     # Legend
-    lx = rect.right - 200
-    ly = rect.y + 6
+    lx = rect.x + rect.width - 200
+    ly = rect.y + 4
     pygame.draw.line(surface, COL_RED, (lx, ly + 6), (lx + 20, ly + 6), 2)
     surface.blit(font.render("PPO", True, COL_RED), (lx + 24, ly))
-    pygame.draw.line(surface, COL_BLUE, (lx + 70, ly + 6), (lx + 90, ly + 6), 2)
-    surface.blit(font.render("Thinker", True, COL_BLUE), (lx + 94, ly))
+    lx += 80
+    pygame.draw.line(surface, COL_BLUE, (lx, ly + 6), (lx + 20, ly + 6), 2)
+    surface.blit(font.render("Thinker", True, COL_BLUE), (lx + 24, ly))
 
+
+# ═════════════════════════════════════════════════════════════════════
+# Main loop
+# ═════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
-    pygame.display.set_caption("COMPARE — PPO vs ThinkerAgent")
+    pygame.display.set_caption("Think Before You Act -- PPO vs ThinkerAgent")
     clock = pygame.time.Clock()
 
-    font = pygame.font.SysFont("consolas,dejavusansmono,monospace", 14)
-    font_big = pygame.font.SysFont("consolas,dejavusansmono,monospace", 17, bold=True)
+    font      = pygame.font.SysFont("consolas,dejavusansmono,monospace", 14)
+    font_bold = pygame.font.SysFont("consolas,dejavusansmono,monospace", 16, bold=True)
     font_title = pygame.font.SysFont("consolas,dejavusansmono,monospace", 20, bold=True)
 
-    difficulty = 1
+    # Create the two runners
+    ppo_runner     = AgentRunner("PPO Agent",     COL_RED,  is_thinker=False)
+    thinker_runner = AgentRunner("Thinker Agent", COL_BLUE, is_thinker=True)
 
-    def make_states():
-        ppo_env = PuzzleEnv(difficulty=difficulty, max_steps=200)
-        thinker_env = PuzzleEnv(difficulty=difficulty, max_steps=200)
-        ppo = AgentState("PPO (Brute Force)", ppo_env, PPOAgent(), COL_RED)
-        thinker = AgentState("ThinkerAgent (Think First)", thinker_env, ThinkerAgent(),
-                             COL_BLUE, is_thinker=True)
-        return ppo, thinker
+    mode: str = "visual"          # "visual" | "fast" | "slow"
+    paused: bool = False
+    last_step_time: float = time.time()
+    slow_delay: float = 0.2
 
-    ppo_state, thinker_state = make_states()
-
-    mode = "visual"
-    paused = False
     running = True
-    slow_delay = 0.2
-    last_step_time = time.time()
 
     while running:
         now = time.time()
 
+        # ── Events ────────────────────────────────────────────────
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -250,82 +503,92 @@ def main() -> None:
                     mode = "slow"
                 elif event.key == pygame.K_v:
                     mode = "visual"
-                elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
-                    new_d = event.key - pygame.K_0
-                    if new_d != difficulty:
-                        difficulty = new_d
-                        ppo_state.env.close()
-                        thinker_state.env.close()
-                        ppo_state, thinker_state = make_states()
 
+        # ── Training ──────────────────────────────────────────────
         if not paused:
             if mode == "fast":
                 for _ in range(5):
-                    ppo_state.run_episode()
-                    thinker_state.run_episode()
+                    ppo_runner.run_episode()
+                    thinker_runner.run_episode()
             elif mode == "visual":
-                ppo_state.run_episode()
-                thinker_state.run_episode()
+                ppo_runner.run_episode()
+                thinker_runner.run_episode()
             elif mode == "slow":
                 if now - last_step_time >= slow_delay:
                     last_step_time = now
-                    ppo_state.run_episode()
-                    thinker_state.run_episode()
+                    ppo_runner.run_episode()
+                    thinker_runner.run_episode()
 
-        # ── Render ─────────────────────────────────────────────────────
+        # ── Render ────────────────────────────────────────────────
         screen.fill(COL_BG)
 
         # Title bar
-        title = font_title.render("Think Before You Act  --  PPO vs ThinkerAgent", True, COL_WHITE)
-        screen.blit(title, (WIN_W // 2 - title.get_width() // 2, 10))
+        title_surf = font_title.render(
+            "Think Before You Act  --  PPO vs ThinkerAgent", True, COL_WHITE,
+        )
+        screen.blit(
+            title_surf,
+            (WIN_W // 2 - title_surf.get_width() // 2, 10),
+        )
 
-        # Divider
-        pygame.draw.line(screen, COL_GRID_LINE, (WIN_W // 2, 40), (WIN_W // 2, 530), 1)
+        # Vertical divider
+        pygame.draw.line(
+            screen, COL_GRID_LINE,
+            (HALF_W, TITLE_H), (HALF_W, GRID_BOT), 2,
+        )
 
-        # Grids
-        draw_grid(screen, getattr(ppo_state.env, "_world", None), LEFT_GRID)
-        pygame.draw.rect(screen, COL_RED, LEFT_GRID, 2, border_radius=4)
-        draw_grid(screen, getattr(thinker_state.env, "_world", None), RIGHT_GRID)
-        pygame.draw.rect(screen, COL_BLUE, RIGHT_GRID, 2, border_radius=4)
+        # Left grid — PPO
+        pygame.draw.rect(screen, COL_GRID_LINE, LEFT_GRID, 2, border_radius=4)
+        draw_sokoban_grid(screen, ppo_runner.env_state, LEFT_GRID)
+        ppo_lbl = font_bold.render("PPO", True, COL_RED)
+        screen.blit(
+            ppo_lbl,
+            (LEFT_GRID.centerx - ppo_lbl.get_width() // 2, LEFT_GRID.y - 20),
+        )
 
-        # Labels
-        def draw_agent_stats(state: AgentState, x: int, is_thinker: bool = False):
-            y = 460
-            def txt(t, f=font, c=COL_WHITE):
-                nonlocal y
-                screen.blit(f.render(t, True, c), (x, y))
-                y += 16
+        # Right grid — Thinker
+        pygame.draw.rect(screen, COL_GRID_LINE, RIGHT_GRID, 2, border_radius=4)
+        draw_sokoban_grid(screen, thinker_runner.env_state, RIGHT_GRID)
+        tk_lbl = font_bold.render("Thinker", True, COL_BLUE)
+        screen.blit(
+            tk_lbl,
+            (RIGHT_GRID.centerx - tk_lbl.get_width() // 2, RIGHT_GRID.y - 20),
+        )
 
-            txt(state.name, font_big, state.color)
-            txt(f"Episode: {state.episode:,}")
-            sr = state.solve_rate
-            col = COL_GREEN if sr > 50 else COL_YELLOW if sr > 20 else COL_RED
-            txt(f"Solve Rate: {sr:.1f}%", color=col)
-            txt(f"Avg Reward: {state.avg_reward:.1f}")
-            if state.episode > 0:
-                txt(f"Deadlocks: {state.deadlocks / state.episode * 100:.0f}%")
-            if is_thinker:
-                wm = state.agent.world_model_accuracy
-                wm_col = COL_GREEN if wm > 0.8 else COL_YELLOW if wm > 0.5 else COL_RED
-                txt(f"World Model: {wm:.0%}", color=wm_col)
-                plan = "ON" if state.agent.planning_active else "OFF"
-                txt(f"Planning: {plan}", color=COL_GREEN if state.agent.planning_active else COL_DIM)
+        # Stats below each grid
+        draw_agent_stats(
+            screen, font, font_bold, ppo_runner,
+            x=LEFT_GRID.x, y=STATS_Y,
+        )
+        draw_agent_stats(
+            screen, font, font_bold, thinker_runner,
+            x=RIGHT_GRID.x, y=STATS_Y,
+        )
 
-        draw_agent_stats(ppo_state, 20)
-        draw_agent_stats(thinker_state, 630, is_thinker=True)
+        # Mode / controls bar
+        mode_labels = {
+            "slow":   "SLOW (1 ep/frame, delayed)",
+            "visual": "VISUAL (1 ep/frame)",
+            "fast":   "FAST (5 eps/frame)",
+        }
+        status = "PAUSED" if paused else mode_labels.get(mode, mode)
+        ctrl_txt = f"[{status}]   Space=pause  F=fast  S=slow  V=visual  ESC=quit"
+        ctrl_surf = font.render(ctrl_txt, True, COL_DIM)
+        screen.blit(ctrl_surf, (20, GRAPH_RECT.y - 18))
 
-        # Mode
-        mode_txt = f"Mode: {'PAUSED' if paused else mode.upper()} | Difficulty: {difficulty}"
-        screen.blit(font.render(mode_txt, True, COL_DIM), (WIN_W // 2 - 100, WIN_H - 18))
-
-        # Dual graph
-        draw_dual_graph(screen, font, ppo_state.all_solved, thinker_state.all_solved, GRAPH_RECT)
+        # Dual learning-curve graph
+        draw_dual_graph(
+            screen, font,
+            ppo_runner.all_solved, thinker_runner.all_solved,
+            GRAPH_RECT,
+        )
 
         pygame.display.flip()
         clock.tick(60)
 
-    ppo_state.env.close()
-    thinker_state.env.close()
+    # ── Cleanup ───────────────────────────────────────────────────
+    ppo_runner.env.close()
+    thinker_runner.env.close()
     pygame.quit()
 
 

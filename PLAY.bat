@@ -2,17 +2,21 @@
 cd /d "%~dp0"
 
 echo Installing dependencies...
-pip install pygame numpy -q
+pip install pygame numpy -q 2>nul
 
 echo.
 echo ==========================================
+echo   SOKOBAN - 60 Levels
+echo ==========================================
 echo   Controls:
-echo   Arrow Keys  - Move
-echo   U           - Undo
-echo   R           - Restart
-echo   N           - Next Level
-echo   H           - Hint
-echo   ESC         - Quit
+echo     Arrow Keys - Move
+echo     U          - Undo
+echo     R          - Restart
+echo     N          - Next Level
+echo     P          - Previous Level
+echo     H          - Hint
+echo     ESC        - Level Select
+echo     Q          - Quit
 echo ==========================================
 echo.
 
