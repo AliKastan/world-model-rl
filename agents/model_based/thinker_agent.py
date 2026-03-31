@@ -1,552 +1,333 @@
-"""ThinkerAgent — the "Think Before You Act" agent.
+"""ThinkerAgent — learns a world model, then thinks before it acts.
 
-Combines world model, affordance analysis, mental simulation, and planning
-into a single agent that reasons about actions before taking them.
+Three learning mechanisms:
+1. **Real experience** — acts in environment, stores transitions
+2. **World model training** — learns to predict transitions from experience
+3. **Dreaming** — imagines episodes using the world model, trains policy on them
 
-Three operating modes:
-  1. "perfect": PerfectWorldModel + AStarPlanner (upper bound)
-  2. "learned": LearnedWorldModel + BeamSearchPlanner (research mode)
-  3. "no_thinking": skip mental sim, use simple heuristic (ablation baseline)
+When the world model is accurate enough, uses beam search planning (mental simulation)
+to look ahead instead of reacting with a raw policy network.
 """
 
 from __future__ import annotations
 
 import random
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from agents.base_agent import BaseAgent
-from agents.model_based.affordance import AffordanceNet, ContextualAffordance
+from agents.model_free.ppo_agent import PPONetwork, PPOMemory, _extract_obs, _obs_to_tensors
+from agents.model_based.world_model import LearnedWorldModel, ReplayBuffer, WorldModelTrainer
 from agents.model_based.mental_sim import MentalSimulator, ThoughtStep
-from agents.model_based.planner import (
-    AStarPlanner,
-    BeamSearchPlanner,
-    BFSPlanner,
-    create_planner,
-    _extract_state,
-    _is_goal,
-)
-from agents.model_based.world_model import (
-    LearnedWorldModel,
-    PerfectWorldModel,
-    WorldModelTrainer,
-    NUM_TYPES,
-)
-from env.puzzle_world import (
-    ACTION_DOWN,
-    ACTION_LEFT,
-    ACTION_RIGHT,
-    ACTION_UP,
-    ACTION_NAMES,
-    PuzzleWorld,
-)
 
-
-ACTIONS = [ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT]
+_MAX_KEYS = 4
+_GRID_H = 12
+_GRID_W = 12
 
 
 class ThinkerAgent(BaseAgent):
     """The "Think Before You Act" agent.
 
-    Uses a world model to plan ahead, mental simulation to strategise,
-    and affordance analysis to understand scene context.
+    Uses a learned world model + beam search planning to solve puzzles
+    more sample-efficiently than pure PPO.
     """
 
     def __init__(
         self,
-        use_perfect_model: bool = True,
-        planner_type: str = "astar",
-        mode: str = "perfect",
-        grid_height: int = 12,
-        grid_width: int = 12,
+        grid_height: int = _GRID_H,
+        grid_width: int = _GRID_W,
+        planning_depth: int = 8,
+        beam_width: int = 3,
+        wm_lr: float = 1e-3,
+        policy_lr: float = 3e-4,
+        planning_threshold: float = 0.7,
+        device: str = "auto",
     ) -> None:
-        self._mode = mode  # "perfect", "learned", "no_thinking"
-        self._use_perfect_model = use_perfect_model if mode != "learned" else False
+        if device == "auto":
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self._device = torch.device(device)
 
-        # --- World model ---
-        self._grid_height = grid_height
-        self._grid_width = grid_width
-        self._world_model = PerfectWorldModel()
-        self._learned_model: Optional[LearnedWorldModel] = None
-        self._trainer: Optional[WorldModelTrainer] = None
-        self._learned_model_initialized = False
-
-        if not self._use_perfect_model:
-            # Defer learned model creation until first observation
-            # (grid dimensions depend on the level)
-            pass
-
-        # --- Affordance ---
-        self._affordance_net = AffordanceNet()
-        self._affordance = ContextualAffordance(net=self._affordance_net)
-
-        # --- Mental simulator ---
-        self._mental_sim = MentalSimulator(
-            world_model=self._world_model,
-            affordance_net=self._affordance,
+        # World model
+        self.world_model = LearnedWorldModel(
+            height=grid_height, width=grid_width
+        ).to(self._device)
+        self.replay_buffer = ReplayBuffer(max_size=50_000)
+        self.wm_trainer = WorldModelTrainer(
+            self.world_model, lr=wm_lr, device=str(self._device)
         )
+        # Use the trainer's internal buffer as our replay buffer
+        self.wm_trainer.buffer = self.replay_buffer
 
-        # --- Planner ---
-        self._planner_type = planner_type
-        self._planner = create_planner(planner_type)
+        # Policy network (PPO-style fallback)
+        self.policy_network = PPONetwork(grid_height, grid_width).to(self._device)
+        self.policy_optimizer = torch.optim.Adam(
+            self.policy_network.parameters(), lr=policy_lr
+        )
+        self.policy_memory = PPOMemory()
 
-        # --- Plan state ---
-        self._current_plan: Optional[List[int]] = None
-        self._plan_step: int = 0
-        self._expected_state: Optional[Any] = None  # PlannerState after expected action
-        self._current_world: Optional[PuzzleWorld] = None
+        # Mental simulation
+        self.mental_sim = MentalSimulator()
+        self.planning_depth = planning_depth
+        self.beam_width = beam_width
+        self.planning_threshold = planning_threshold
 
-        # --- Thought log ---
-        self.thought_log: List[ThoughtStep] = []
-
-        # --- Metrics ---
-        self._total_steps = 0
-        self._total_thinks = 0
-        self._total_replans = 0
-        self._total_plan_completions = 0
-        self._plan_lengths: List[int] = []
-        self._strategies_per_think: List[int] = []
-        self._thinking_times_ms: List[float] = []
-        self._learn_step_counter = 0
+        # Tracking
+        self.world_model_accuracy = 0.0
+        self.planning_active = False
+        self.total_dreams = 0
+        self.last_thought: Optional[ThoughtStep] = None
 
     @property
     def name(self) -> str:
-        if self._mode == "no_thinking":
-            return "ThinkerAgent-NoThinking"
-        model_tag = "Perfect" if self._use_perfect_model else "Learned"
-        return f"ThinkerAgent-{model_tag}"
+        return "ThinkerAgent"
 
-    # ------------------------------------------------------------------
-    # Act
-    # ------------------------------------------------------------------
+    # -- Action selection ---------------------------------------------------
+
+    def select_action(
+        self, observation: Dict[str, Any]
+    ) -> Tuple[int, Optional[ThoughtStep]]:
+        """Pick an action. Uses planning if world model is accurate, else policy.
+
+        Returns (action, thought_info_or_None).
+        """
+        if (self.world_model_accuracy >= self.planning_threshold
+                and len(self.replay_buffer) >= 500):
+            # Plan ahead with world model
+            self.planning_active = True
+            action, thought = self.mental_sim.think_ahead(
+                observation, self.world_model,
+                depth=self.planning_depth, beam_width=self.beam_width,
+            )
+            self.last_thought = thought
+            return action, thought
+
+        # Fallback: use policy network (like PPO)
+        self.planning_active = False
+        self.last_thought = None
+        action, log_prob, value = self._policy_select(observation)
+        return action, None
 
     def act(self, observation: Dict[str, Any]) -> int:
-        self._total_steps += 1
+        action, _ = self.select_action(observation)
+        return action
 
-        if self._mode == "no_thinking":
-            return self._act_no_thinking(observation)
-
-        return self._act_thinking(observation)
-
-    def _act_thinking(self, observation: Dict[str, Any]) -> int:
-        """Smart re-planning: only re-think when needed."""
-
-        # Check if current plan is still valid
-        if self._current_plan is not None and self._plan_step < len(self._current_plan):
-            # Verify world state matches expectation
-            if self._expected_state is not None and self._current_world is not None:
-                actual_state = _extract_state(self._current_world)
-                if actual_state == self._expected_state:
-                    # Plan still valid — execute next step
-                    action = self._current_plan[self._plan_step]
-                    self._plan_step += 1
-                    self._advance_expected_state(action)
-
-                    # Check if plan completed
-                    if self._plan_step >= len(self._current_plan):
-                        self._total_plan_completions += 1
-                        self._current_plan = None
-
-                    return action
-                # State mismatch — need to replan
-                self._total_replans += 1
-            else:
-                # First step of plan — just execute
-                action = self._current_plan[self._plan_step]
-                self._plan_step += 1
-                self._advance_expected_state(action)
-                return action
-
-        # --- Need to think ---
-        t0 = time.perf_counter()
-
-        # Try planner first (fast, optimal for perfect model)
-        plan = None
-        if self._current_world is not None:
-            if isinstance(self._planner, BeamSearchPlanner):
-                plan = self._planner.plan(
-                    self._world_model, self._current_world,
-                    beam_width=5, max_depth=30,
-                )
-            else:
-                plan = self._planner.plan(
-                    self._world_model, self._current_world, max_depth=50,
-                )
-
-        if plan is not None and len(plan) > 0:
-            # Planner found a solution
-            self._current_plan = plan
-            self._plan_step = 0
-            self._plan_lengths.append(len(plan))
-
-            # Generate a thought step for logging
-            if self._current_world is not None:
-                action, thought = self._mental_sim.think(observation, self._current_world)
-                self.thought_log.append(thought)
-                self._strategies_per_think.append(len(thought.strategies_considered))
-                self._total_thinks += 1
-
-            dt = (time.perf_counter() - t0) * 1000
-            self._thinking_times_ms.append(dt)
-
-            action = self._current_plan[self._plan_step]
-            self._plan_step += 1
-            self._advance_expected_state(action)
-            return action
-
-        # Planner failed — fall back to mental sim
-        if self._current_world is not None:
-            action, thought = self._mental_sim.think(observation, self._current_world)
-            self.thought_log.append(thought)
-            self._total_thinks += 1
-            self._strategies_per_think.append(len(thought.strategies_considered))
-
-            if thought.chosen_strategy and thought.chosen_strategy.action_sequence:
-                self._current_plan = thought.chosen_strategy.action_sequence
-                self._plan_step = 1  # already returning action 0
-                self._plan_lengths.append(len(self._current_plan))
-                self._advance_expected_state(action)
-
-            dt = (time.perf_counter() - t0) * 1000
-            self._thinking_times_ms.append(dt)
-            return action
-
-        # Total fallback — random valid move
-        return random.choice(ACTIONS)
-
-    def _act_no_thinking(self, observation: Dict[str, Any]) -> int:
-        """Ablation: no mental simulation, just a simple heuristic."""
-        if self._current_world is None:
-            return random.choice(ACTIONS)
-
-        # Simple heuristic: try each action, pick the one with best reward
-        best_action = random.choice(ACTIONS)
-        best_reward = float("-inf")
-
-        for action in ACTIONS:
-            clone = self._current_world.clone()
-            _obs, reward, _term, _trunc, _info = clone.step(action)
-            # Penalize deadlocks heavily
-            if clone.is_deadlock():
-                reward -= 100.0
-            if reward > best_reward:
-                best_reward = reward
-                best_action = action
-
-        return best_action
-
-    def _advance_expected_state(self, action: int) -> None:
-        """Update expected state by simulating the action in the world model."""
-        if self._current_world is not None:
-            next_world, _, _ = self._world_model.predict(self._current_world, action)
-            self._expected_state = _extract_state(next_world)
-
-    def set_world(self, world: PuzzleWorld) -> None:
-        """Provide the current world state (called by the game loop)."""
-        self._current_world = world
-
-    def _ensure_learned_model(self, grid: np.ndarray) -> None:
-        """Lazily initialize the learned world model from actual grid dimensions."""
-        if self._learned_model_initialized:
-            return
-        h, w = grid.shape
-        self._learned_model = LearnedWorldModel(
-            height=h, width=w, num_types=NUM_TYPES
-        )
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._trainer = WorldModelTrainer(self._learned_model, lr=1e-3, device=device)
-        self._learned_model_initialized = True
-
-    # ------------------------------------------------------------------
-    # Learn
-    # ------------------------------------------------------------------
-
-    def learn(self, **kwargs: Any) -> Dict[str, Any]:
-        """Run one round of learning.
-
-        Expected kwargs:
-            state: observation dict
-            action: int
-            next_state: observation dict
-            reward: float
-            done: bool
-            world: PuzzleWorld (current world for state extraction)
-        """
-        metrics: Dict[str, Any] = {}
-
-        if self._mode == "perfect" or self._mode == "no_thinking":
-            # No learning needed for perfect model
-            return metrics
-
-        # Learned mode: accumulate experience
-        state = kwargs.get("state")
-        action = kwargs.get("action")
-        next_state = kwargs.get("next_state")
-        reward = kwargs.get("reward")
-        done = kwargs.get("done")
-
-        if all(v is not None for v in [state, action, next_state, reward, done]):
-            self._ensure_learned_model(state["grid"])
-            self._trainer.add_experience(
-                grid=state["grid"],
-                agent_pos=np.array(state["agent_pos"], dtype=np.float32),
-                action=action,
-                next_grid=next_state["grid"],
-                next_agent_pos=np.array(next_state["agent_pos"], dtype=np.float32),
-                reward=reward,
-                done=done,
+    def _policy_select(
+        self, obs: Dict[str, Any]
+    ) -> Tuple[int, float, float]:
+        """Sample from policy network (training mode)."""
+        self.policy_network.eval()
+        with torch.no_grad():
+            probs, value = self.policy_network(
+                *_obs_to_tensors(obs, self._device)
             )
-            self._learn_step_counter += 1
+            dist = torch.distributions.Categorical(probs)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+        return int(action.item()), float(log_prob.item()), float(value.item())
 
-            # Train every 100 steps
-            if self._learn_step_counter % 100 == 0 and len(self._trainer.buffer) >= 128:
-                for _ in range(10):
-                    loss = self._trainer.train_step(batch_size=128)
-                if loss:
-                    metrics.update(loss)
+    def get_action_probs(self, observation: Dict[str, Any]) -> np.ndarray:
+        self.policy_network.eval()
+        with torch.no_grad():
+            probs, _ = self.policy_network(
+                *_obs_to_tensors(observation, self._device)
+            )
+        return probs.squeeze(0).cpu().numpy()
 
+    # -- Experience collection ----------------------------------------------
+
+    def store_experience(
+        self, obs: Dict[str, Any], action: int,
+        next_obs: Dict[str, Any], reward: float, done: bool
+    ) -> None:
+        """Store a real transition in the replay buffer."""
+        grid = np.asarray(obs["grid"])
+        pos = np.array(obs["agent_pos"], dtype=np.float32)
+        next_grid = np.asarray(next_obs["grid"])
+        next_pos = np.array(next_obs["agent_pos"], dtype=np.float32)
+
+        self.replay_buffer.add(
+            grid, pos, action, next_grid, next_pos, reward, done
+        )
+
+        # Also store in policy memory for PPO-style updates (when not planning)
+        if not self.planning_active:
+            _, log_prob, value = self._policy_select(obs)
+            self.policy_memory.store(obs, action, reward, log_prob, value, done)
+
+    # -- World model learning -----------------------------------------------
+
+    def learn_world_model(self, train_steps: int = 10) -> Dict[str, float]:
+        """Train the world model on the replay buffer."""
+        if len(self.replay_buffer) < 128:
+            return {}
+
+        metrics = {}
+        for _ in range(train_steps):
+            step_metrics = self.wm_trainer.train_step(batch_size=64)
+            if step_metrics:
+                metrics = step_metrics
+
+        # Compute accuracy
+        self._update_accuracy()
         return metrics
 
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
+    def _update_accuracy(self) -> None:
+        """Estimate world model accuracy on a sample from the replay buffer."""
+        if len(self.replay_buffer) < 100:
+            self.world_model_accuracy = 0.0
+            return
 
-    def get_thought_log(self) -> List[ThoughtStep]:
-        return self.thought_log
+        grids, positions, actions, next_grids, _, _, _ = self.replay_buffer.sample(
+            min(200, len(self.replay_buffer))
+        )
+        dev = self._device
+        g = torch.tensor(grids, dtype=torch.long, device=dev)
+        p = torch.tensor(positions, dtype=torch.float32, device=dev)
+        a = torch.tensor(actions, dtype=torch.long, device=dev)
 
-    def get_metrics(self) -> Dict[str, Any]:
-        total = max(self._total_steps, 1)
-        return {
-            "total_thinks": self._total_thinks,
-            "avg_strategies_per_think": (
-                sum(self._strategies_per_think) / max(len(self._strategies_per_think), 1)
-            ),
-            "avg_plan_length": (
-                sum(self._plan_lengths) / max(len(self._plan_lengths), 1)
-            ),
-            "replan_rate": self._total_replans / total,
-            "plan_completion_rate": (
-                self._total_plan_completions / max(self._total_thinks, 1)
-            ),
-            "thinking_time_ms": (
-                sum(self._thinking_times_ms) / max(len(self._thinking_times_ms), 1)
-            ),
-        }
+        pred_g, _, _, _ = self.world_model.predict(g, p, a)
+        self.world_model_accuracy = float(
+            (pred_g.cpu().numpy() == next_grids).mean()
+        )
 
-    # ------------------------------------------------------------------
-    # Save / Load
-    # ------------------------------------------------------------------
+    # -- Dreaming (model-based data augmentation) ---------------------------
+
+    def dream_and_learn(self, n_episodes: int = 50, max_steps: int = 30) -> None:
+        """Generate imagined episodes using the world model.
+
+        Then train the policy network on this imagined data.
+        This is what makes us more sample-efficient than PPO.
+        """
+        if self.world_model_accuracy < 0.5 or len(self.replay_buffer) < 500:
+            return
+
+        dream_memory = PPOMemory()
+        dev = self._device
+
+        for _ in range(n_episodes):
+            # Sample a starting state from the replay buffer
+            grids, positions, _, _, _, _, _ = self.replay_buffer.sample(1)
+            grid_t = torch.tensor(grids[0], dtype=torch.long, device=dev)
+            pos_t = torch.tensor(positions[0], dtype=torch.float32, device=dev)
+
+            for step in range(max_steps):
+                # Build observation dict for policy
+                obs = {
+                    "grid": grid_t.cpu().numpy(),
+                    "agent_pos": pos_t.cpu().numpy().astype(np.float32),
+                    "inventory": np.zeros(_MAX_KEYS, dtype=np.int8),
+                }
+
+                action, log_prob, value = self._policy_select(obs)
+
+                # Predict next state with world model
+                g = grid_t.unsqueeze(0)
+                p = pos_t.unsqueeze(0)
+                a = torch.tensor([action], device=dev)
+                pred_grid, pred_pos, pred_reward, pred_done = \
+                    self.world_model.predict(g, p, a)
+
+                reward = pred_reward.squeeze().item()
+                done = pred_done.squeeze().item() > 0.5
+
+                dream_memory.store(obs, action, reward, log_prob, value, done)
+
+                grid_t = pred_grid.squeeze(0)
+                pos_t = pred_pos.squeeze(0)
+
+                if done:
+                    break
+
+        self.total_dreams += n_episodes
+
+        # PPO update on dreamed data
+        if len(dream_memory) > 0:
+            self._ppo_update(dream_memory)
+
+        # Also update on real data if available
+        if len(self.policy_memory) > 0:
+            self._ppo_update(self.policy_memory)
+
+    def _ppo_update(
+        self, memory: PPOMemory,
+        gamma: float = 0.99, gae_lambda: float = 0.95,
+        clip_eps: float = 0.2, epochs: int = 4, batch_size: int = 64,
+    ) -> None:
+        """Run a PPO update on the given memory buffer."""
+        if len(memory) == 0:
+            return
+
+        import torch.nn.functional as F
+
+        dev = self._device
+        self.policy_network.train()
+
+        grids = torch.tensor(np.array(memory.grids), dtype=torch.long, device=dev)
+        positions = torch.tensor(np.array(memory.positions), dtype=torch.float32, device=dev)
+        inventories = torch.tensor(np.array(memory.inventories), dtype=torch.float32, device=dev)
+        actions = torch.tensor(memory.actions, dtype=torch.long, device=dev)
+        old_lp = torch.tensor(memory.log_probs, dtype=torch.float32, device=dev)
+        rewards = np.array(memory.rewards, dtype=np.float32)
+        values = np.array(memory.values, dtype=np.float32)
+        dones = np.array(memory.dones, dtype=np.float32)
+
+        # GAE
+        n = len(rewards)
+        advantages = np.zeros(n, dtype=np.float32)
+        last_gae = 0.0
+        for t in reversed(range(n)):
+            nv = 0.0 if t == n - 1 else values[t + 1]
+            nt = 1.0 - dones[t]
+            delta = rewards[t] + gamma * nv * nt - values[t]
+            last_gae = delta + gamma * gae_lambda * nt * last_gae
+            advantages[t] = last_gae
+        returns = advantages + values
+
+        adv_t = torch.tensor(advantages, dtype=torch.float32, device=dev)
+        ret_t = torch.tensor(returns, dtype=torch.float32, device=dev)
+        adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+
+        for _ in range(epochs):
+            for idx in memory.get_batches(batch_size):
+                probs, vals = self.policy_network(
+                    grids[idx], positions[idx], inventories[idx]
+                )
+                dist = torch.distributions.Categorical(probs)
+                new_lp = dist.log_prob(actions[idx])
+                entropy = dist.entropy().mean()
+
+                ratio = torch.exp(new_lp - old_lp[idx])
+                s1 = ratio * adv_t[idx]
+                s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_t[idx]
+                p_loss = -torch.min(s1, s2).mean()
+                v_loss = F.mse_loss(vals.squeeze(-1), ret_t[idx])
+                loss = p_loss + 0.5 * v_loss - 0.01 * entropy
+
+                self.policy_optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy_network.parameters(), 0.5)
+                self.policy_optimizer.step()
+
+        memory.clear()
+
+    # -- BaseAgent interface ------------------------------------------------
+
+    def learn(self, **kwargs: Any) -> Dict[str, Any]:
+        metrics = self.learn_world_model()
+        self.dream_and_learn()
+        return metrics
 
     def save(self, path: str) -> None:
-        state = {
-            "mode": self._mode,
-            "planner_type": self._planner_type,
-            "affordance_net": self._affordance_net.state_dict(),
-        }
-        if self._learned_model is not None:
-            state["learned_model"] = self._learned_model.state_dict()
-        torch.save(state, path)
+        torch.save({
+            "world_model": self.world_model.state_dict(),
+            "policy_network": self.policy_network.state_dict(),
+        }, path)
 
     def load(self, path: str) -> None:
         state = torch.load(path, weights_only=False)
-        self._affordance_net.load_state_dict(state["affordance_net"])
-        if "learned_model" in state and self._learned_model is not None:
-            self._learned_model.load_state_dict(state["learned_model"])
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Random baseline agent
-# ═══════════════════════════════════════════════════════════════════════
-
-
-class RandomAgent(BaseAgent):
-    """Uniform random action selection — the simplest possible baseline."""
-
-    @property
-    def name(self) -> str:
-        return "RandomAgent"
-
-    def act(self, observation: Dict[str, Any]) -> int:
-        return random.choice(ACTIONS)
-
-    def learn(self, **kwargs: Any) -> Dict[str, Any]:
-        return {}
-
-    def save(self, path: str) -> None:
-        pass
-
-    def load(self, path: str) -> None:
-        pass
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Episode runner
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def run_episode(
-    agent: BaseAgent,
-    world: PuzzleWorld,
-    max_steps: int = 200,
-    verbose: bool = False,
-) -> Dict[str, Any]:
-    """Run one episode and return metrics."""
-    world = world.clone()
-    total_reward = 0.0
-    steps = 0
-
-    # Give ThinkerAgent access to world
-    if isinstance(agent, ThinkerAgent):
-        agent.set_world(world)
-
-    for step in range(max_steps):
-        obs = world.get_observation()
-        action = agent.act(obs)
-
-        _obs_next, reward, terminated, truncated, _info = world.step(action)
-        total_reward += reward
-        steps += 1
-
-        # Update world reference for ThinkerAgent
-        if isinstance(agent, ThinkerAgent):
-            agent.set_world(world)
-            next_obs = world.get_observation()
-            agent.learn(
-                state=obs, action=action, next_state=next_obs,
-                reward=reward, done=terminated or truncated, world=world,
-            )
-
-        if verbose and step < 5:
-            print(f"  Step {step + 1}: action={ACTION_NAMES[action]}, reward={reward:.1f}")
-
-        if terminated or truncated:
-            break
-
-    solved = _is_goal(world) or world.solved
-    return {
-        "solved": solved,
-        "steps": steps,
-        "total_reward": total_reward,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Test
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def main() -> None:
-    from env.level_generator import LevelGenerator
-
-    gen = LevelGenerator()
-
-    print("=" * 70)
-    print("ThinkerAgent — Comprehensive Test")
-    print("=" * 70)
-
-    # ------------------------------------------------------------------
-    # Test 1: Difficulty 1-5 with ThinkerAgent (perfect model)
-    # ------------------------------------------------------------------
-    print("\n--- Test 1: ThinkerAgent (perfect) across difficulties ---")
-    print(f"{'Diff':>4} {'Solved':>8} {'Avg Steps':>10} {'Avg Reward':>11}")
-    print("-" * 37)
-
-    for difficulty in range(1, 6):
-        solved_count = 0
-        total_steps = 0
-        total_reward = 0.0
-        n_levels = 10
-
-        for seed in range(n_levels):
-            try:
-                world = gen.generate(difficulty=difficulty, seed=seed + 100)
-            except RuntimeError:
-                continue
-
-            agent = ThinkerAgent(use_perfect_model=True, planner_type="astar", mode="perfect")
-            result = run_episode(agent, world, max_steps=world.max_steps)
-            if result["solved"]:
-                solved_count += 1
-            total_steps += result["steps"]
-            total_reward += result["total_reward"]
-
-        avg_steps = total_steps / n_levels
-        avg_reward = total_reward / n_levels
-        print(f"  {difficulty:>2}   {solved_count:>2}/{n_levels:<2}   {avg_steps:>8.1f}   {avg_reward:>9.1f}")
-
-    # ------------------------------------------------------------------
-    # Test 2: Compare ThinkerAgent vs RandomAgent on Level 4
-    # ------------------------------------------------------------------
-    print("\n--- Test 2: ThinkerAgent vs RandomAgent on difficulty 4 ---")
-
-    world4 = gen.generate(difficulty=4, seed=42)
-
-    # ThinkerAgent
-    thinker = ThinkerAgent(use_perfect_model=True, planner_type="astar", mode="perfect")
-    thinker_result = run_episode(thinker, world4, max_steps=world4.max_steps)
-    thinker_metrics = thinker.get_metrics()
-
-    # RandomAgent — average over 10 runs
-    random_solved = 0
-    random_steps_total = 0
-    n_random = 10
-    for _ in range(n_random):
-        rand_agent = RandomAgent()
-        r = run_episode(rand_agent, world4, max_steps=world4.max_steps)
-        if r["solved"]:
-            random_solved += 1
-        random_steps_total += r["steps"]
-
-    print(f"  ThinkerAgent: {'SOLVED' if thinker_result['solved'] else 'FAILED'} "
-          f"in {thinker_result['steps']} steps, reward={thinker_result['total_reward']:.1f}")
-    print(f"  RandomAgent:  {random_solved}/{n_random} solved, "
-          f"avg {random_steps_total / n_random:.0f} steps")
-    print(f"  Thinker metrics: thinks={thinker_metrics['total_thinks']}, "
-          f"avg_plan_len={thinker_metrics['avg_plan_length']:.1f}, "
-          f"think_time={thinker_metrics['thinking_time_ms']:.1f}ms")
-
-    # ------------------------------------------------------------------
-    # Test 3: Thought log for one Level 5 solve
-    # ------------------------------------------------------------------
-    print("\n--- Test 3: Thought log for Level 5 solve ---")
-
-    world5 = gen.generate(difficulty=5, seed=42)
-    thinker5 = ThinkerAgent(use_perfect_model=True, planner_type="astar", mode="perfect")
-    result5 = run_episode(thinker5, world5, max_steps=world5.max_steps)
-
-    print(f"  Result: {'SOLVED' if result5['solved'] else 'FAILED'} "
-          f"in {result5['steps']} steps, reward={result5['total_reward']:.1f}")
-
-    log = thinker5.get_thought_log()
-    print(f"  Thought steps: {len(log)}")
-    for i, thought in enumerate(log[:3]):  # Show first 3 thoughts
-        print(f"\n  --- Thought {i + 1} ---")
-        summary = MentalSimulator.get_thought_summary(thought)
-        for line in summary.split("\n"):
-            print(f"  {line}")
-
-    if len(log) > 3:
-        print(f"\n  ... ({len(log) - 3} more thought steps)")
-
-    # ------------------------------------------------------------------
-    # Test 4: Ablation — no_thinking mode
-    # ------------------------------------------------------------------
-    print("\n--- Test 4: Ablation — no_thinking mode ---")
-
-    no_think = ThinkerAgent(mode="no_thinking")
-    nt_result = run_episode(no_think, world4, max_steps=world4.max_steps)
-    print(f"  no_thinking: {'SOLVED' if nt_result['solved'] else 'FAILED'} "
-          f"in {nt_result['steps']} steps, reward={nt_result['total_reward']:.1f}")
-    print(f"  vs ThinkerAgent-Perfect: {'SOLVED' if thinker_result['solved'] else 'FAILED'} "
-          f"in {thinker_result['steps']} steps")
-
-    print("\n" + "=" * 70)
-    print("All tests complete.")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()
+        self.world_model.load_state_dict(state["world_model"])
+        self.policy_network.load_state_dict(state["policy_network"])

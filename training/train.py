@@ -1,10 +1,9 @@
-"""Main training script for puzzle agents.
+"""Training loops for PPO and ThinkerAgent.
 
 Usage::
 
-    python -m training.train --agent ppo --difficulty 1 --timesteps 100000
-
-See ``--help`` for the full set of options.
+    python -m training.train --agent ppo --difficulty 1 --episodes 5000
+    python -m training.train --agent thinker --difficulty 1 --episodes 2000
 """
 
 from __future__ import annotations
@@ -13,344 +12,166 @@ import argparse
 import os
 import sys
 import time
-from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-# Ensure project root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import gymnasium
-import env.gym_env  # noqa: F401  — triggers registration
-
-from stable_baselines3.common.callbacks import BaseCallback
+import env.gym_env  # noqa: F401 — triggers registration
 
 
-# ---------------------------------------------------------------------------
-# Evaluation callback (runs inside SB3 .learn())
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════
+# PPO training
+# ═══════════════════════════════════════════════════════════════════════
 
-class _EvalCallback(BaseCallback):
-    """Periodic evaluation + curriculum + checkpointing inside SB3 training.
 
-    This single callback handles eval, checkpointing, curriculum adjustment,
-    console progress, and metric collection so that SB3's ``model.learn()``
-    does everything in one call.
+def train_ppo(
+    agent: Any,
+    env: Any,
+    n_episodes: int = 10_000,
+    update_every: int = 10,
+) -> Tuple[List[float], List[bool]]:
+    """Train a PPOAgent through trial and error.
+
+    The agent starts random and gradually learns from experience.
     """
+    all_rewards: List[float] = []
+    all_solved: List[bool] = []
 
-    def __init__(
-        self,
-        eval_env: gymnasium.Env,
-        eval_freq: int = 4096,
-        eval_episodes: int = 10,
-        checkpoint_dir: str = "checkpoints",
-        checkpoint_freq: int = 20480,
-        curriculum: bool = False,
-        difficulty: int = 1,
-        verbose: int = 1,
-    ) -> None:
-        super().__init__(verbose)
-        self.eval_env = eval_env
-        self.eval_freq = eval_freq
-        self.eval_episodes = eval_episodes
-        self.checkpoint_dir = checkpoint_dir
-        self.checkpoint_freq = checkpoint_freq
-        self.curriculum = curriculum
-        self.difficulty = difficulty
+    for episode in range(n_episodes):
+        obs, info = env.reset()
+        episode_reward = 0.0
+        done = False
 
-        # Metric history (for plotting)
-        self.eval_timesteps: List[int] = []
-        self.eval_rewards: List[float] = []
-        self.eval_solve_rates: List[float] = []
-        self.eval_avg_steps: List[float] = []
+        while not done:
+            action, log_prob, value = agent.select_action(obs)
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            agent.memory.store(obs, action, reward, log_prob, value, done)
+            obs = next_obs
+            episode_reward += reward
 
-        # Curriculum tracking
-        self._recent_solves: deque = deque(maxlen=100)
+        all_rewards.append(episode_reward)
+        all_solved.append(info.get("solved", False))
 
-        # Episode-level tracking from training rollouts
-        self.train_rewards: List[float] = []
-        self.train_solves: List[bool] = []
-        self.train_steps_list: List[int] = []
-        self._ep_reward = 0.0
+        if (episode + 1) % update_every == 0:
+            agent.update()
 
-        self._last_eval_step = 0
-        self._last_ckpt_step = 0
-        self._t0 = time.monotonic()
+        if (episode + 1) % 100 == 0:
+            recent_r = all_rewards[-100:]
+            recent_s = all_solved[-100:]
+            sr = sum(recent_s) / len(recent_s) * 100
+            ar = sum(recent_r) / len(recent_r)
+            tag = "[+++]" if sr > 50 else "[++ ]" if sr > 20 else "[+  ]"
+            print(f"  Episode {episode + 1:>6}/{n_episodes} | "
+                  f"Avg Reward: {ar:>7.1f} | Solve Rate: {sr:>5.1f}% | {tag}")
 
-    def _on_step(self) -> bool:
-        # Accumulate episode reward from info buffers
-        infos = self.locals.get("infos", [])
-        for info in infos:
-            ep_info = info.get("episode")
-            if ep_info is not None:
-                self.train_rewards.append(ep_info["r"])
-                self.train_steps_list.append(int(ep_info["l"]))
-            if info.get("solved", False):
-                self.train_solves.append(True)
-                self._recent_solves.append(True)
-            elif "TimeLimit.truncated" in info or info.get("is_deadlock", False):
-                self.train_solves.append(False)
-                self._recent_solves.append(False)
-
-        # Periodic evaluation
-        if self.num_timesteps - self._last_eval_step >= self.eval_freq:
-            self._last_eval_step = self.num_timesteps
-            self._run_eval()
-
-        # Periodic checkpoint
-        if self.num_timesteps - self._last_ckpt_step >= self.checkpoint_freq:
-            self._last_ckpt_step = self.num_timesteps
-            self._save_checkpoint()
-
-        return True
-
-    def _run_eval(self) -> None:
-        rewards = []
-        steps = []
-        solves = 0
-        for ep in range(self.eval_episodes):
-            obs, info = self.eval_env.reset(seed=10000 + ep)
-            ep_reward = 0.0
-            done = False
-            while not done:
-                action, _ = self.model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = self.eval_env.step(int(action))
-                ep_reward += reward
-                done = terminated or truncated
-            rewards.append(ep_reward)
-            steps.append(info.get("steps_taken", 0))
-            if info.get("solved", False):
-                solves += 1
-
-        avg_reward = float(np.mean(rewards))
-        avg_steps = float(np.mean(steps))
-        solve_rate = solves / self.eval_episodes
-
-        self.eval_timesteps.append(self.num_timesteps)
-        self.eval_rewards.append(avg_reward)
-        self.eval_solve_rates.append(solve_rate)
-        self.eval_avg_steps.append(avg_steps)
-
-        elapsed = time.monotonic() - self._t0
-        print(
-            f"  [{self.num_timesteps:>8d} steps | {elapsed:>6.0f}s] "
-            f"eval reward={avg_reward:>7.1f}  solve={solve_rate:>5.0%}  "
-            f"steps={avg_steps:>5.1f}  diff={self.difficulty}"
-        )
-
-        # Curriculum adjustment
-        if self.curriculum and len(self._recent_solves) >= 20:
-            recent_rate = sum(self._recent_solves) / len(self._recent_solves)
-            if recent_rate > 0.80 and self.difficulty < 10:
-                self.difficulty += 1
-                self.eval_env.difficulty = self.difficulty
-                print(f"  >>> Curriculum: difficulty UP to {self.difficulty}")
-                self._recent_solves.clear()
-            elif recent_rate < 0.20 and self.difficulty > 1:
-                self.difficulty -= 1
-                self.eval_env.difficulty = self.difficulty
-                print(f"  >>> Curriculum: difficulty DOWN to {self.difficulty}")
-                self._recent_solves.clear()
-
-    def _save_checkpoint(self) -> None:
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        path = os.path.join(self.checkpoint_dir, f"model_{self.num_timesteps}")
-        self.model.save(path)
-        if self.verbose:
-            print(f"  [checkpoint] saved to {path}")
+    return all_rewards, all_solved
 
 
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-
-def _save_plots(
-    callback: _EvalCallback,
-    output_dir: str,
-    agent_name: str,
-) -> None:
-    """Save training curve plots to *output_dir*."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    os.makedirs(output_dir, exist_ok=True)
-    ts = callback.eval_timesteps
-
-    if not ts:
-        print("  No eval data to plot.")
-        return
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle(f"{agent_name} Training Curves", fontsize=14)
-
-    # Reward
-    axes[0].plot(ts, callback.eval_rewards, color="#6366f1", linewidth=1.5)
-    axes[0].set_xlabel("Timesteps")
-    axes[0].set_ylabel("Avg Eval Reward")
-    axes[0].set_title("Reward")
-    axes[0].grid(alpha=0.3)
-
-    # Solve rate
-    axes[1].plot(ts, callback.eval_solve_rates, color="#34d399", linewidth=1.5)
-    axes[1].set_xlabel("Timesteps")
-    axes[1].set_ylabel("Solve Rate")
-    axes[1].set_title("Solve Rate")
-    axes[1].set_ylim(-0.05, 1.05)
-    axes[1].grid(alpha=0.3)
-
-    # Steps per episode
-    axes[2].plot(ts, callback.eval_avg_steps, color="#fbbf24", linewidth=1.5)
-    axes[2].set_xlabel("Timesteps")
-    axes[2].set_ylabel("Avg Steps")
-    axes[2].set_title("Steps / Episode")
-    axes[2].grid(alpha=0.3)
-
-    plt.tight_layout()
-    path = os.path.join(output_dir, f"{agent_name.lower()}_training_curves.png")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"  Training curves saved to {path}")
+# ═══════════════════════════════════════════════════════════════════════
+# ThinkerAgent training
+# ═══════════════════════════════════════════════════════════════════════
 
 
-# ---------------------------------------------------------------------------
-# WandB helpers
-# ---------------------------------------------------------------------------
+def train_thinker(
+    agent: Any,
+    env: Any,
+    n_episodes: int = 2_000,
+    wm_train_every: int = 10,
+    dream_every: int = 50,
+) -> Tuple[List[float], List[bool]]:
+    """Train a ThinkerAgent with world model + dreaming.
 
-def _maybe_init_wandb(args: argparse.Namespace) -> bool:
-    if not args.wandb:
-        return False
-    try:
-        import wandb
-        wandb.init(
-            project="world-model-rl",
-            config=vars(args),
-            name=f"{args.agent}_d{args.difficulty}_{args.seed}",
-        )
-        return True
-    except ImportError:
-        print("  wandb not installed, skipping.")
-        return False
+    Much more sample-efficient than PPO thanks to planning ahead.
+    """
+    all_rewards: List[float] = []
+    all_solved: List[bool] = []
+
+    for episode in range(n_episodes):
+        obs, info = env.reset()
+        episode_reward = 0.0
+        done = False
+
+        while not done:
+            action, thought_info = agent.select_action(obs)
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+
+            agent.store_experience(obs, action, next_obs, reward, done)
+            obs = next_obs
+            episode_reward += reward
+
+        all_rewards.append(episode_reward)
+        all_solved.append(info.get("solved", False))
+
+        # Train world model periodically
+        if (episode + 1) % wm_train_every == 0:
+            agent.learn_world_model()
+
+        # Dream periodically (once world model is decent)
+        if (episode + 1) % dream_every == 0:
+            agent.dream_and_learn()
+
+        if (episode + 1) % 100 == 0:
+            recent_r = all_rewards[-100:]
+            recent_s = all_solved[-100:]
+            sr = sum(recent_s) / len(recent_s) * 100
+            ar = sum(recent_r) / len(recent_r)
+            wm_acc = getattr(agent, "world_model_accuracy", 0.0)
+            planning = "ON" if getattr(agent, "planning_active", False) else "OFF"
+            print(f"  Episode {episode + 1:>6}/{n_episodes} | "
+                  f"Reward: {ar:>7.1f} | Solve: {sr:>5.1f}% | "
+                  f"WM: {wm_acc:.0%} | Plan: {planning}")
+
+    return all_rewards, all_solved
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════
 
-def main(argv: Optional[List[str]] = None) -> None:
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Train puzzle agents")
-    parser.add_argument("--agent", type=str, default="ppo", choices=["ppo", "thinker"])
+    parser.add_argument("--agent", default="ppo", choices=["ppo", "thinker"])
     parser.add_argument("--difficulty", type=int, default=1)
-    parser.add_argument("--timesteps", type=int, default=100_000,
-                        help="Total environment timesteps to train")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--render", action="store_true")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    parser.add_argument("--checkpoint-freq", type=int, default=20480)
-    parser.add_argument("--eval-freq", type=int, default=4096)
-    parser.add_argument("--eval-episodes", type=int, default=10)
-    parser.add_argument("--curriculum", action="store_true")
-    parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--n-steps", type=int, default=None,
-                        help="PPO rollout buffer size (default: from config)")
-    parser.add_argument("--lr", type=float, default=None,
-                        help="Learning rate override")
-    args = parser.parse_args(argv)
+    parser.add_argument("--episodes", type=int, default=5000)
+    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--save", type=str, default=None)
+    args = parser.parse_args()
+
+    from env.gym_env import PuzzleEnv
 
     print("=" * 60)
-    print(f"  Agent:      {args.agent}")
-    print(f"  Difficulty: {args.difficulty}")
-    print(f"  Timesteps:  {args.timesteps:,}")
-    print(f"  Seed:       {args.seed}")
-    print(f"  Curriculum: {args.curriculum}")
-    print(f"  Device:     {args.device}")
+    print(f"  Training {args.agent.upper()} | difficulty={args.difficulty} | "
+          f"episodes={args.episodes}")
     print("=" * 60)
 
-    use_wandb = _maybe_init_wandb(args)
+    env = PuzzleEnv(difficulty=args.difficulty, max_steps=args.max_steps)
 
-    # Use tier-appropriate max_steps for faster episode turnover
-    from env.level_generator import _TIERS
-    tier_max_steps = _TIERS.get(args.difficulty, _TIERS[1]).max_steps
+    t0 = time.monotonic()
 
-    # Create environments
-    render_mode = "human" if args.render else None
-    train_env = gymnasium.make(
-        "ThinkPuzzle-v0",
-        difficulty=args.difficulty,
-        max_steps=tier_max_steps,
-        render_mode=render_mode,
-    )
-    eval_env = gymnasium.make(
-        "ThinkPuzzle-v0",
-        difficulty=args.difficulty,
-        max_steps=tier_max_steps,
-    )
-
-    # Create agent
     if args.agent == "ppo":
         from agents.model_free.ppo_agent import PPOAgent
-        ppo_overrides = {}
-        if args.n_steps is not None:
-            ppo_overrides["n_steps"] = args.n_steps
-        if args.lr is not None:
-            ppo_overrides["learning_rate"] = args.lr
-        agent = PPOAgent(
-            env=train_env,
-            seed=args.seed,
-            device=args.device,
-            **ppo_overrides,
-        )
+        agent = PPOAgent()
+        all_rewards, all_solved = train_ppo(agent, env, n_episodes=args.episodes)
     else:
-        raise NotImplementedError(f"Agent '{args.agent}' not yet implemented")
+        from agents.model_based.thinker_agent import ThinkerAgent
+        agent = ThinkerAgent()
+        all_rewards, all_solved = train_thinker(agent, env, n_episodes=args.episodes)
 
-    print(f"\n  Training {agent.name} for {args.timesteps:,} timesteps ...\n")
-
-    # Build callback
-    callback = _EvalCallback(
-        eval_env=eval_env,
-        eval_freq=args.eval_freq,
-        eval_episodes=args.eval_episodes,
-        checkpoint_dir=args.checkpoint_dir,
-        checkpoint_freq=args.checkpoint_freq,
-        curriculum=args.curriculum,
-        difficulty=args.difficulty,
-    )
-
-    # Train via SB3 .learn() with our callback
-    t0 = time.monotonic()
-    agent.model.learn(
-        total_timesteps=args.timesteps,
-        callback=callback,
-        progress_bar=True,
-    )
     elapsed = time.monotonic() - t0
+    total_solved = sum(all_solved)
+    print(f"\n  Done in {elapsed:.1f}s — {total_solved}/{len(all_solved)} solved "
+          f"({total_solved / max(len(all_solved), 1) * 100:.1f}%)")
 
-    print(f"\n  Training complete in {elapsed:.1f}s")
+    if args.save:
+        agent.save(args.save)
+        print(f"  Model saved to {args.save}")
 
-    # Save final model
-    final_path = os.path.join(args.checkpoint_dir, "model_final")
-    agent.save(final_path)
-    print(f"  Final model saved to {final_path}")
-
-    # Save plots
-    results_dir = os.path.join("experiments", "results")
-    _save_plots(callback, results_dir, agent.name)
-
-    # Final eval summary
-    if callback.eval_solve_rates:
-        best_sr = max(callback.eval_solve_rates)
-        final_sr = callback.eval_solve_rates[-1]
-        print(f"\n  Best solve rate:  {best_sr:.0%}")
-        print(f"  Final solve rate: {final_sr:.0%}")
-
-    if use_wandb:
-        import wandb
-        wandb.finish()
-
-    train_env.close()
-    eval_env.close()
+    env.close()
 
 
 if __name__ == "__main__":
