@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 
 echo Installing dependencies...
-pip install pygame numpy -q 2>nul
+pip install pygame -q 2>nul
 
 echo.
 echo ==========================================
@@ -14,7 +14,6 @@ echo     U          - Undo
 echo     R          - Restart
 echo     N          - Next Level
 echo     P          - Previous Level
-echo     H          - Hint
 echo     ESC        - Level Select
 echo     Q          - Quit
 echo ==========================================

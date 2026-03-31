@@ -1,436 +1,778 @@
-"""TRAIN_AND_WATCH -- Watch a PPO agent learn Sokoban in real-time.
-
-Opens a PyGame window (920x640). Left side shows the Sokoban grid,
-right side shows training stats, a learning curve, and action probs.
+"""
+TRAIN_AND_WATCH.py - Watch a PPO agent learn Sokoban from scratch.
+Completely self-contained. Dependencies: pygame, torch, numpy only.
 
 Controls:
-  Space  -- Pause / Resume
-  F      -- Fast mode   (10 episodes per frame, skip rendering)
-  S      -- Slow mode   (1 step per frame, 150ms delay)
-  V      -- Visual mode (1 episode per frame, render final state)
-  ESC    -- Quit
+  V     - Visual mode (render every episode, ~2 eps/sec)
+  F     - Fast mode (skip rendering, full speed)
+  S     - Slow mode (render every step, 200ms delay)
+  Space - Pause / Resume
+  Q     - Quit
 """
 
-from __future__ import annotations
-
-import sys
-import time
-from typing import List
-
+import random, math, time
+from collections import deque
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
 import pygame
 
-from env.sokoban_env import SokobanEnv
-from agents.model_free.ppo_agent import PPOAgent
+# =====================================================================
+# 1. SOKOBAN ENGINE
+# =====================================================================
+
+class SokobanState:
+    __slots__ = ("width", "height", "walls", "boxes", "targets", "player")
+
+    def __init__(self, w, h, walls, boxes, targets, player):
+        self.width = w
+        self.height = h
+        self.walls = frozenset(walls)
+        self.boxes = frozenset(boxes)
+        self.targets = frozenset(targets)
+        self.player = player
+
+    def move(self, action):
+        dx, dy = [(0, -1), (0, 1), (-1, 0), (1, 0)][action]
+        nx, ny = self.player[0] + dx, self.player[1] + dy
+        if (nx, ny) in self.walls:
+            return None
+        if (nx, ny) in self.boxes:
+            bx, by = nx + dx, ny + dy
+            if (bx, by) in self.walls or (bx, by) in self.boxes:
+                return None
+            new_boxes = (self.boxes - {(nx, ny)}) | {(bx, by)}
+            return SokobanState(self.width, self.height, self.walls,
+                                new_boxes, self.targets, (nx, ny))
+        return SokobanState(self.width, self.height, self.walls,
+                            self.boxes, self.targets, (nx, ny))
+
+    def is_solved(self):
+        return self.boxes == self.targets
+
+    def is_deadlocked(self):
+        for bx, by in self.boxes:
+            if (bx, by) in self.targets:
+                continue
+            wl = (bx - 1, by) in self.walls
+            wr = (bx + 1, by) in self.walls
+            wu = (bx, by - 1) in self.walls
+            wd = (bx, by + 1) in self.walls
+            if (wl or wr) and (wu or wd):
+                return True
+        return False
+
+    def box_distances(self):
+        total = 0
+        for bx, by in self.boxes:
+            total += min(abs(bx - tx) + abs(by - ty) for tx, ty in self.targets)
+        return total
+
+    def key(self):
+        return (self.player, self.boxes)
 
 
-# ── Colours ───────────────────────────────────────────────────────────
-COL_BG         = (22, 22, 35)
-COL_PANEL      = (30, 30, 50)
-COL_GRID_LINE  = (40, 40, 55)
-COL_WALL       = (75, 85, 99)
-COL_BOX        = (251, 191, 36)
-COL_BOX_DONE   = (52, 211, 153)
-COL_TARGET     = (52, 211, 153)
-COL_PLAYER     = (99, 102, 241)
-COL_WHITE      = (220, 220, 235)
-COL_DIM        = (120, 120, 140)
-COL_GREEN      = (52, 211, 153)
-COL_YELLOW     = (251, 191, 36)
-COL_RED        = (239, 68, 68)
-COL_GRAPH_BG   = (30, 30, 50)
-COL_GRAPH_LINE = (52, 211, 153)
-COL_DASH       = (50, 50, 70)
-
-# ── Layout ────────────────────────────────────────────────────────────
-WIN_W, WIN_H = 920, 640
-GRID_AREA    = pygame.Rect(10, 10, 560, 560)
-STATS_X      = 590
-STATS_W      = 320
-GRAPH_RECT   = pygame.Rect(STATS_X, 380, STATS_W, 180)
-PROBS_RECT   = pygame.Rect(STATS_X, 570, STATS_W, 60)
-
-# ── Training constants ────────────────────────────────────────────────
-N_EPISODES       = 10_000
-STEPS_PER_UPDATE = 1024
-SLOW_DELAY       = 0.15
+def bfs_solve(state, max_states=200000):
+    if state.is_solved():
+        return True
+    visited = {state.key()}
+    queue = deque([state])
+    while queue and len(visited) < max_states:
+        s = queue.popleft()
+        for a in range(4):
+            ns = s.move(a)
+            if ns is None:
+                continue
+            k = ns.key()
+            if k in visited:
+                continue
+            if ns.is_solved():
+                return True
+            if ns.is_deadlocked():
+                continue
+            visited.add(k)
+            queue.append(ns)
+    return False
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Grid Renderer
-# ══════════════════════════════════════════════════════════════════════
+# =====================================================================
+# 2. LEVEL GENERATOR
+# =====================================================================
 
-def draw_grid(surface: pygame.Surface, state, area: pygame.Rect) -> None:
-    """Draw the Sokoban grid from a SokobanState."""
-    if state is None:
-        return
-
-    gw, gh = state.width, state.height
-    cs = min(area.width // gw, area.height // gh)
-    ox = area.x + (area.width  - gw * cs) // 2
-    oy = area.y + (area.height - gh * cs) // 2
-
-    # Background cells and grid lines
-    for gy in range(gh):
-        for gx in range(gw):
-            rect = pygame.Rect(ox + gx * cs, oy + gy * cs, cs, cs)
-            pygame.draw.rect(surface, COL_BG, rect)
-            pygame.draw.rect(surface, COL_GRID_LINE, rect, 1)
-
-    # Walls
-    for (wx, wy) in state.walls:
-        rect = pygame.Rect(ox + wx * cs, oy + wy * cs, cs, cs)
-        pygame.draw.rect(surface, COL_WALL, rect, border_radius=3)
-
-    # Targets (circle outline)
-    for (tx, ty) in state.targets:
-        cx = ox + tx * cs + cs // 2
-        cy = oy + ty * cs + cs // 2
-        pygame.draw.circle(surface, COL_TARGET, (cx, cy), cs // 4, 2)
-
-    # Boxes
-    boxes_on_target = state.boxes & state.targets
-    for (bx, by) in state.boxes:
-        rect = pygame.Rect(ox + bx * cs, oy + by * cs, cs, cs)
-        colour = COL_BOX_DONE if (bx, by) in boxes_on_target else COL_BOX
-        pygame.draw.rect(surface, colour, rect.inflate(-6, -6), border_radius=4)
-
-    # Player (filled circle)
-    px, py = state.player
-    pcx = ox + px * cs + cs // 2
-    pcy = oy + py * cs + cs // 2
-    pygame.draw.circle(surface, COL_PLAYER, (pcx, pcy), cs // 3)
+PHASE_CONFIG = [
+    {"min_w": 5, "max_w": 6, "min_h": 5, "max_h": 6, "boxes": 1,
+     "max_steps": 150, "name": "Phase 1: One Box"},
+    {"min_w": 6, "max_w": 8, "min_h": 6, "max_h": 8, "boxes": 2,
+     "max_steps": 250, "name": "Phase 2: Two Boxes"},
+    {"min_w": 7, "max_w": 9, "min_h": 7, "max_h": 9, "boxes": 3,
+     "max_steps": 400, "name": "Phase 3: Three Boxes"},
+]
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Stats Panel
-# ══════════════════════════════════════════════════════════════════════
-
-def draw_stats(
-    surface: pygame.Surface,
-    font: pygame.font.Font,
-    font_big: pygame.font.Font,
-    episode: int,
-    all_rewards: List[float],
-    all_solved: List[bool],
-    deadlocks: int,
-    avg_steps: float,
-    mode: str,
-    paused: bool,
-) -> None:
-    x = STATS_X
-    y = 15
-
-    def text(txt, f=font, color=COL_WHITE):
-        nonlocal y
-        s = f.render(txt, True, color)
-        surface.blit(s, (x, y))
-        y += s.get_height() + 4
-
-    # Episode counter
-    text(f"Episode: {episode} / {N_EPISODES}", font_big)
-
-    # Solve rate
-    if all_solved:
-        recent = all_solved[-100:]
-        sr = sum(recent) / len(recent) * 100
-        col = COL_GREEN if sr > 50 else COL_YELLOW if sr > 20 else COL_RED
-        text(f"Solve Rate: {sr:.1f}%", color=col)
-    else:
-        text("Solve Rate: --%")
-
-    # Average reward
-    if all_rewards:
-        ar = sum(all_rewards[-100:]) / len(all_rewards[-100:])
-        text(f"Avg Reward: {ar:.1f}")
-    else:
-        text("Avg Reward: --")
-
-    # Deadlock rate
-    if episode > 0:
-        dr = deadlocks / episode * 100
-        text(f"Deadlock Rate: {dr:.0f}%")
-    else:
-        text("Deadlock Rate: --%")
-
-    # Average steps
-    text(f"Avg Steps: {avg_steps:.0f}" if avg_steps > 0 else "Avg Steps: --")
-
-    y += 8
-
-    # Mode indicator
-    mode_map = {
-        "visual": "VISUAL",
-        "fast":   "FAST",
-        "slow":   "SLOW",
-    }
-    label = "PAUSED" if paused else mode_map.get(mode, mode.upper())
-    text(f"Mode: {label}", color=COL_DIM)
+def generate_level(width, height, n_boxes, seed=None):
+    rng = random.Random(seed)
+    walls = set()
+    for x in range(width):
+        walls.add((x, 0))
+        walls.add((x, height - 1))
+    for y in range(height):
+        walls.add((0, y))
+        walls.add((width - 1, y))
+    interior = [(x, y) for x in range(1, width - 1)
+                for y in range(1, height - 1)]
+    n_iw = rng.randint(0, max(0, len(interior) // 5 - n_boxes * 2))
+    rng.shuffle(interior)
+    for i in range(min(n_iw, len(interior))):
+        walls.add(interior[i])
+    free = [p for p in interior if p not in walls]
+    if len(free) < 2 * n_boxes + 1:
+        return None
+    # flood-fill connectivity check
+    start = free[0]
+    visited = {start}
+    stack = [start]
+    while stack:
+        cx, cy = stack.pop()
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nb = (cx + dx, cy + dy)
+            if nb not in visited and nb not in walls \
+                    and 0 <= nb[0] < width and 0 <= nb[1] < height:
+                visited.add(nb)
+                stack.append(nb)
+    if len(visited) != len(free):
+        return None
+    rng.shuffle(free)
+    targets = free[:n_boxes]
+    boxes_pos = free[n_boxes:2 * n_boxes]
+    player = free[2 * n_boxes]
+    if set(boxes_pos) & set(targets):
+        return None
+    state = SokobanState(width, height, walls, boxes_pos, targets, player)
+    if state.is_deadlocked():
+        return None
+    if not bfs_solve(state):
+        return None
+    return state
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Learning Curve Graph
-# ══════════════════════════════════════════════════════════════════════
-
-def draw_graph(
-    surface: pygame.Surface,
-    font: pygame.font.Font,
-    all_solved: List[bool],
-    rect: pygame.Rect,
-) -> None:
-    pygame.draw.rect(surface, COL_GRAPH_BG, rect, border_radius=4)
-
-    lbl = font.render("Solve Rate (rolling 100)", True, COL_DIM)
-    surface.blit(lbl, (rect.x + 4, rect.y + 2))
-
-    graph_x = rect.x + 4
-    graph_w = rect.width - 8
-    graph_y = rect.y + 20
-    graph_h = rect.height - 28
-
-    # Axis lines
-    pygame.draw.line(
-        surface, COL_DIM,
-        (graph_x, graph_y + graph_h),
-        (graph_x + graph_w, graph_y + graph_h), 1,
-    )
-    pygame.draw.line(
-        surface, COL_DIM,
-        (graph_x, graph_y),
-        (graph_x, graph_y + graph_h), 1,
-    )
-
-    # Dashed 50% line
-    mid_y = graph_y + graph_h // 2
-    for dx in range(0, graph_w, 6):
-        pygame.draw.line(
-            surface, COL_DASH,
-            (graph_x + dx, mid_y),
-            (graph_x + dx + 3, mid_y), 1,
-        )
-
-    if len(all_solved) < 2:
-        return
-
-    # Compute rolling solve rate
-    window = 100
-    rates: List[float] = []
-    for i in range(len(all_solved)):
-        start = max(0, i - window + 1)
-        chunk = all_solved[start : i + 1]
-        rates.append(sum(chunk) / len(chunk))
-
-    # Build point list
-    n = len(rates)
-    x_scale = graph_w / max(n - 1, 1)
-    points = []
-    for i, r in enumerate(rates):
-        px = graph_x + int(i * x_scale)
-        py = graph_y + graph_h - int(r * graph_h)
-        points.append((px, py))
-
-    if len(points) >= 2:
-        pygame.draw.lines(surface, COL_GRAPH_LINE, False, points, 2)
+def make_level_for_phase(phase_idx):
+    cfg = PHASE_CONFIG[phase_idx]
+    for _ in range(500):
+        w = random.randint(cfg["min_w"], cfg["max_w"])
+        h = random.randint(cfg["min_h"], cfg["max_h"])
+        s = generate_level(w, h, cfg["boxes"], seed=random.randint(0, 999999))
+        if s is not None:
+            return s
+    return None
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Action Probability Bars
-# ══════════════════════════════════════════════════════════════════════
+# =====================================================================
+# 3. GYM ENVIRONMENT
+# =====================================================================
 
-def draw_action_probs(
-    surface: pygame.Surface,
-    font: pygame.font.Font,
-    probs: np.ndarray,
-    rect: pygame.Rect,
-) -> None:
-    pygame.draw.rect(surface, COL_PANEL, rect, border_radius=4)
+class SokobanEnv:
+    OBS_W, OBS_H = 10, 10
 
-    labels = ["UP", "DN", "LT", "RT"]
-    bar_h = 10
-    bar_max_w = rect.width - 70
-    y = rect.y + 6
+    def __init__(self):
+        self.phase = 0
+        self.state = None
+        self.steps = 0
+        self.prev_dist = 0
+        self.prev_on = 0
 
-    for lbl, p in zip(labels, probs):
-        txt = font.render(f"{lbl} {p:.2f}", True, COL_DIM)
-        surface.blit(txt, (rect.x + 4, y))
-        bw = int(p * bar_max_w)
-        bar_rect = pygame.Rect(rect.x + 50, y + 2, max(bw, 0), bar_h)
-        pygame.draw.rect(surface, COL_PLAYER, bar_rect, border_radius=2)
-        y += bar_h + 4
+    def reset(self):
+        self.state = make_level_for_phase(self.phase)
+        if self.state is None:
+            self.state = make_level_for_phase(0)
+        self.steps = 0
+        self.prev_dist = self.state.box_distances()
+        self.prev_on = len(self.state.boxes & self.state.targets)
+        return self._obs()
+
+    def _obs(self):
+        obs = np.zeros((5, self.OBS_H, self.OBS_W), dtype=np.float32)
+        s = self.state
+        for x, y in s.walls:
+            if x < self.OBS_W and y < self.OBS_H:
+                obs[0, y, x] = 1.0
+        for x, y in s.boxes - s.targets:
+            if x < self.OBS_W and y < self.OBS_H:
+                obs[1, y, x] = 1.0
+        for x, y in s.targets - s.boxes:
+            if x < self.OBS_W and y < self.OBS_H:
+                obs[2, y, x] = 1.0
+        px, py = s.player
+        if px < self.OBS_W and py < self.OBS_H:
+            obs[3, py, px] = 1.0
+        for x, y in s.boxes & s.targets:
+            if x < self.OBS_W and y < self.OBS_H:
+                obs[4, y, x] = 1.0
+        return obs
+
+    def step(self, action):
+        self.steps += 1
+        ns = self.state.move(action)
+        max_steps = PHASE_CONFIG[self.phase]["max_steps"]
+        if ns is None:
+            done = self.steps >= max_steps
+            return self._obs(), -1.0, done, {"invalid": True}
+        self.state = ns
+        if ns.is_solved():
+            return self._obs(), 100.0, True, {"solved": True}
+        if ns.is_deadlocked():
+            return self._obs(), -50.0, True, {"deadlock": True}
+        reward = -0.1
+        new_dist = ns.box_distances()
+        reward += float(self.prev_dist - new_dist)
+        self.prev_dist = new_dist
+        new_on = len(ns.boxes & ns.targets)
+        if new_on > self.prev_on:
+            reward += 10.0 * (new_on - self.prev_on)
+        elif new_on < self.prev_on:
+            reward -= 10.0 * (self.prev_on - new_on)
+        self.prev_on = new_on
+        done = self.steps >= max_steps
+        return self._obs(), reward, done, {}
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Training Loop Helpers
-# ══════════════════════════════════════════════════════════════════════
+# =====================================================================
+# 4. NEURAL NETWORK
+# =====================================================================
 
-class Trainer:
-    """Encapsulates the PPO training state."""
+class SokobanNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(5, 32, 3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.conv3 = nn.Conv2d(64, 64, 3, padding=1)
+        self.fc = nn.Linear(64 * 10 * 10, 512)
+        self.policy_head = nn.Linear(512, 4)
+        self.value_head = nn.Linear(512, 1)
 
-    def __init__(self) -> None:
-        self.env = SokobanEnv(level_set="training", max_h=10, max_w=10, max_steps=200)
-        self.agent = PPOAgent(grid_h=10, grid_w=10)
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.reshape(x.size(0), -1)
+        x = F.relu(self.fc(x))
+        policy = F.softmax(self.policy_head(x), dim=-1)
+        value = self.value_head(x)
+        return policy, value
 
-        self.obs, _ = self.env.reset()
-        self.ep_reward = 0.0
-        self.ep_steps = 0
 
-        self.episode = 0
+# =====================================================================
+# 5. PPO AGENT
+# =====================================================================
+
+class PPOAgent:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.net = SokobanNet().to(self.device)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=2.5e-4,
+                                          eps=1e-5)
+        self.gamma = 0.99
+        self.gae_lambda = 0.95
+        self.clip_eps = 0.2
+        self.ent_coef = 0.01
+        self.vf_coef = 0.5
+        self.max_grad_norm = 0.5
+        self.ppo_epochs = 4
+        self.mini_batch_size = 128
+        self.steps_per_update = 512
+        # buffers
+        self.buf_obs = []
+        self.buf_act = []
+        self.buf_rew = []
+        self.buf_lp = []
+        self.buf_val = []
+        self.buf_done = []
+        # tracking
         self.total_steps = 0
-        self.deadlocks = 0
+        self.updates = 0
+        self.last_loss = 0.0
 
-        self.all_rewards: List[float] = []
-        self.all_solved:  List[bool]  = []
-        self.all_ep_steps: List[int]  = []
-        self.action_probs = np.array([0.25, 0.25, 0.25, 0.25])
+    def encode_state(self, obs):
+        return torch.FloatTensor(obs).unsqueeze(0).to(self.device)
 
-    @property
-    def avg_steps(self) -> float:
-        if not self.all_ep_steps:
-            return 0.0
-        recent = self.all_ep_steps[-100:]
-        return sum(recent) / len(recent)
+    def select_action(self, obs):
+        with torch.no_grad():
+            probs, value = self.net(self.encode_state(obs))
+            dist = Categorical(probs)
+            action = dist.sample()
+            return action.item(), dist.log_prob(action).item(), value.item()
 
-    # ── Single step ───────────────────────────────────────────────────
-    def do_one_step(self) -> bool:
-        """Execute one environment step. Returns True if episode ended."""
-        self.action_probs[:] = self.agent.get_action_probs(self.obs)
-        action, log_prob, value = self.agent.select_action(self.obs)
-        next_obs, reward, term, trunc, info = self.env.step(action)
-        done = term or trunc
+    def get_action_probs(self, obs):
+        with torch.no_grad():
+            probs, _ = self.net(self.encode_state(obs))
+            return probs.cpu().numpy()[0]
 
-        self.agent.store_transition(self.obs, action, reward, log_prob, value, done)
-        self.obs = next_obs
-        self.ep_reward += reward
-        self.ep_steps += 1
+    def store_transition(self, obs, action, reward, log_prob, value, done):
+        self.buf_obs.append(obs.copy())
+        self.buf_act.append(action)
+        self.buf_rew.append(reward)
+        self.buf_lp.append(log_prob)
+        self.buf_val.append(value)
+        self.buf_done.append(done)
         self.total_steps += 1
 
-        if done:
-            self._finish_episode(info)
+    def ready_to_update(self):
+        return len(self.buf_obs) >= self.steps_per_update
 
-        # Trigger PPO update every STEPS_PER_UPDATE collected steps
-        if self.total_steps % STEPS_PER_UPDATE == 0 and self.total_steps > 0:
-            self.agent.update()
+    def compute_gae(self):
+        n = len(self.buf_rew)
+        advantages = np.zeros(n, dtype=np.float32)
+        last_gae = 0.0
+        for t in reversed(range(n)):
+            if self.buf_done[t]:
+                next_val = 0.0
+                last_gae = 0.0
+            else:
+                next_val = self.buf_val[t + 1] if t + 1 < n else 0.0
+            delta = self.buf_rew[t] + self.gamma * next_val - self.buf_val[t]
+            last_gae = delta + self.gamma * self.gae_lambda * last_gae
+            advantages[t] = last_gae
+        returns = advantages + np.array(self.buf_val, dtype=np.float32)
+        return advantages, returns
 
-        return done
+    def update(self):
+        if not self.buf_obs:
+            return {}
+        advantages, returns = self.compute_gae()
+        states_t = torch.FloatTensor(np.array(self.buf_obs)).to(self.device)
+        actions_t = torch.LongTensor(self.buf_act).to(self.device)
+        old_lp_t = torch.FloatTensor(self.buf_lp).to(self.device)
+        adv_t = torch.FloatTensor(advantages).to(self.device)
+        ret_t = torch.FloatTensor(returns).to(self.device)
+        adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+        n = len(self.buf_obs)
+        total_loss = 0.0
+        count = 0
+        for _ in range(self.ppo_epochs):
+            idx = np.arange(n)
+            np.random.shuffle(idx)
+            for start in range(0, n, self.mini_batch_size):
+                end = min(start + self.mini_batch_size, n)
+                mb = idx[start:end]
+                probs, values = self.net(states_t[mb])
+                dist = Categorical(probs)
+                new_lp = dist.log_prob(actions_t[mb])
+                entropy = dist.entropy().mean()
+                ratio = torch.exp(new_lp - old_lp_t[mb])
+                s1 = ratio * adv_t[mb]
+                s2 = torch.clamp(ratio, 1 - self.clip_eps,
+                                 1 + self.clip_eps) * adv_t[mb]
+                pi_loss = -torch.min(s1, s2).mean()
+                v_loss = F.mse_loss(values.squeeze(-1), ret_t[mb])
+                loss = pi_loss + self.vf_coef * v_loss - self.ent_coef * entropy
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.net.parameters(),
+                                         self.max_grad_norm)
+                self.optimizer.step()
+                total_loss += loss.item()
+                count += 1
+        self.buf_obs.clear()
+        self.buf_act.clear()
+        self.buf_rew.clear()
+        self.buf_lp.clear()
+        self.buf_val.clear()
+        self.buf_done.clear()
+        self.updates += 1
+        self.last_loss = total_loss / max(count, 1)
+        return {"loss": self.last_loss}
 
-    def _finish_episode(self, info: dict) -> None:
-        self.all_rewards.append(self.ep_reward)
-        self.all_solved.append(info.get("solved", False))
-        self.all_ep_steps.append(self.ep_steps)
-        if info.get("deadlock", False):
-            self.deadlocks += 1
-        self.episode += 1
 
-        self.obs, _ = self.env.reset()
-        self.ep_reward = 0.0
-        self.ep_steps = 0
+# =====================================================================
+# 6. PYGAME VISUALIZATION
+# =====================================================================
 
-    # ── Full episode ──────────────────────────────────────────────────
-    def run_episode(self) -> None:
-        """Run one complete episode."""
-        while not self.do_one_step():
-            pass
-
-    @property
-    def state(self):
-        """Current SokobanState for rendering."""
-        return self.env.state
-
-    def close(self) -> None:
-        self.env.close()
+WIN_W, WIN_H = 1000, 700
+BG = (18, 18, 30)
+PANEL_BG = (25, 25, 40)
+WALL_COL = (65, 70, 85)
+WALL_LIGHT = (90, 95, 110)
+WALL_DARK = (45, 48, 60)
+PLAYER_COL = (99, 102, 241)
+BOX_COL = (240, 180, 40)
+BOX_ON_COL = (60, 200, 120)
+TARGET_COL = (52, 211, 153)
+FLOOR_COL = (30, 32, 46)
+TEXT_COL = (220, 220, 230)
+DIM_TEXT = (130, 130, 150)
+ACCENT = (99, 102, 241)
+GRAPH_BG = (30, 30, 48)
+ACTION_NAMES = ["UP", "DN", "LT", "RT"]
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Main
-# ══════════════════════════════════════════════════════════════════════
+def draw_grid(surf, state, area_x, area_y, area_w, area_h, pulse_t):
+    if state is None:
+        return
+    gw, gh = state.width, state.height
+    cell = min(area_w // gw, area_h // gh)
+    ox = area_x + (area_w - gw * cell) // 2
+    oy = area_y + (area_h - gh * cell) // 2
+    on_target = state.boxes & state.targets
+    off_boxes = state.boxes - state.targets
+    empty_targets = state.targets - state.boxes
 
-def main() -> None:
+    # floor and walls
+    for y in range(gh):
+        for x in range(gw):
+            r = pygame.Rect(ox + x * cell, oy + y * cell, cell, cell)
+            if (x, y) in state.walls:
+                pygame.draw.rect(surf, WALL_COL, r)
+                pygame.draw.line(surf, WALL_LIGHT, r.topleft, r.topright, 2)
+                pygame.draw.line(surf, WALL_LIGHT, r.topleft, r.bottomleft, 2)
+                pygame.draw.line(surf, WALL_DARK, r.bottomleft, r.bottomright, 2)
+                pygame.draw.line(surf, WALL_DARK, r.topright, r.bottomright, 2)
+            else:
+                pygame.draw.rect(surf, FLOOR_COL, r)
+                pygame.draw.rect(surf, (40, 42, 56), r, 1)
+
+    # targets (pulsing concentric circles)
+    for tx, ty in empty_targets:
+        cx = ox + tx * cell + cell // 2
+        cy = oy + ty * cell + cell // 2
+        pulse = int(3 * math.sin(pulse_t * 3))
+        for i, alpha in enumerate([40, 80, 160]):
+            rad = cell // 4 + 2 - i + pulse
+            if rad > 0:
+                c = (TARGET_COL[0] * alpha // 255,
+                     TARGET_COL[1] * alpha // 255,
+                     TARGET_COL[2] * alpha // 255)
+                pygame.draw.circle(surf, c, (cx, cy), rad, 2)
+
+    # boxes not on target
+    for bx, by in off_boxes:
+        r = pygame.Rect(ox + bx * cell + 3, oy + by * cell + 3,
+                        cell - 6, cell - 6)
+        pygame.draw.rect(surf, BOX_COL, r, border_radius=4)
+        sr = pygame.Rect(r.x + 3, r.y + 3, r.w - 6, r.h - 6)
+        dark = (max(BOX_COL[0] - 50, 0), max(BOX_COL[1] - 50, 0),
+                max(BOX_COL[2] - 50, 0))
+        pygame.draw.rect(surf, dark, sr, border_radius=3)
+
+    # boxes on target (with glow)
+    for bx, by in on_target:
+        r = pygame.Rect(ox + bx * cell + 3, oy + by * cell + 3,
+                        cell - 6, cell - 6)
+        glow_r = pygame.Rect(r.x - 2, r.y - 2, r.w + 4, r.h + 4)
+        glow = (BOX_ON_COL[0] // 2, BOX_ON_COL[1] // 2, BOX_ON_COL[2] // 2)
+        pygame.draw.rect(surf, glow, glow_r, border_radius=6)
+        pygame.draw.rect(surf, BOX_ON_COL, r, border_radius=4)
+        dark = (max(BOX_ON_COL[0] - 40, 0), max(BOX_ON_COL[1] - 40, 0),
+                max(BOX_ON_COL[2] - 40, 0))
+        sr = pygame.Rect(r.x + 3, r.y + 3, r.w - 6, r.h - 6)
+        pygame.draw.rect(surf, dark, sr, border_radius=3)
+
+    # player (circle with eyes)
+    px, py = state.player
+    cx = ox + px * cell + cell // 2
+    cy = oy + py * cell + cell // 2
+    rad = cell // 2 - 4
+    pygame.draw.circle(surf, PLAYER_COL, (cx, cy), rad)
+    er = max(rad // 5, 2)
+    pygame.draw.circle(surf, (255, 255, 255),
+                       (cx - rad // 3, cy - rad // 4), er)
+    pygame.draw.circle(surf, (255, 255, 255),
+                       (cx + rad // 3, cy - rad // 4), er)
+    pygame.draw.circle(surf, (20, 20, 40),
+                       (cx - rad // 3, cy - rad // 4), max(er // 2, 1))
+    pygame.draw.circle(surf, (20, 20, 40),
+                       (cx + rad // 3, cy - rad // 4), max(er // 2, 1))
+
+
+def draw_panel(surf, stats, agent, obs, fonts, graph_data, pulse_t):
+    px = 630
+    pygame.draw.rect(surf, PANEL_BG, (620, 0, 380, WIN_H))
+    y = 12
+    f_big, f_med, f_sm = fonts
+
+    # Episode
+    t = f_med.render(f"Episode: {stats['episode']}", True, TEXT_COL)
+    surf.blit(t, (px, y))
+    y += 32
+
+    # Phase
+    t = f_sm.render(PHASE_CONFIG[stats['phase']]['name'], True, ACCENT)
+    surf.blit(t, (px, y))
+    y += 26
+
+    # Solve rate with colour coding
+    sr = stats['solve_rate']
+    if sr < 10:
+        sc = (230, 60, 60)
+    elif sr < 30:
+        sc = (230, 140, 40)
+    elif sr < 60:
+        sc = (220, 200, 50)
+    elif sr < 80:
+        sc = (80, 200, 120)
+    else:
+        sc = ACCENT
+    t = f_sm.render("Solve Rate:", True, DIM_TEXT)
+    surf.blit(t, (px, y))
+    t = f_big.render(f"{sr:.1f}%", True, sc)
+    surf.blit(t, (px + 140, y - 6))
+    y += 42
+
+    # Avg reward, avg steps, deadlock rate
+    for label, key, fmt in [("Avg Reward", "avg_reward", ".1f"),
+                             ("Avg Steps", "avg_steps", ".0f"),
+                             ("Deadlock %", "deadlock_rate", ".1f")]:
+        t = f_sm.render(f"{label}: {stats[key]:{fmt}}", True, DIM_TEXT)
+        surf.blit(t, (px, y))
+        y += 22
+    y += 8
+
+    # Learning curve graph
+    gx, gy, gw, gh = px, y, 320, 210
+    pygame.draw.rect(surf, GRAPH_BG, (gx, gy, gw, gh), border_radius=6)
+    t = f_sm.render("Solve Rate History", True, DIM_TEXT)
+    surf.blit(t, (gx + 4, gy + 2))
+    # dashed 50% line
+    mid_y = gy + 20 + (gh - 30) // 2
+    for dx in range(0, gw - 40, 8):
+        pygame.draw.line(surf, (60, 60, 80),
+                         (gx + 30 + dx, mid_y), (gx + 30 + dx + 4, mid_y))
+    t = f_sm.render("50%", True, (80, 80, 100))
+    surf.blit(t, (gx + 2, mid_y - 7))
+    # plot data
+    if len(graph_data) > 1:
+        max_ep = max(1, graph_data[-1][0])
+        plot_x, plot_y2 = gx + 30, gy + 20
+        plot_w, plot_h = gw - 40, gh - 30
+        pts = []
+        for ep, val in graph_data:
+            ppx = plot_x + int(ep / max_ep * plot_w)
+            ppy = plot_y2 + plot_h - int(val / 100.0 * plot_h)
+            pts.append((ppx, ppy))
+        if len(pts) >= 2:
+            pygame.draw.lines(surf, ACCENT, False, pts, 2)
+    y += gh + 10
+
+    # Action probability bars
+    if obs is not None:
+        probs = agent.get_action_probs(obs)
+        t = f_sm.render("Action Probs:", True, DIM_TEXT)
+        surf.blit(t, (px, y))
+        y += 20
+        bar_w = 180
+        for i in range(4):
+            lbl = f_sm.render(ACTION_NAMES[i], True, TEXT_COL)
+            surf.blit(lbl, (px, y + 1))
+            bx = px + 35
+            pygame.draw.rect(surf, (40, 40, 55),
+                             (bx, y, bar_w, 16), border_radius=3)
+            fw = int(probs[i] * bar_w)
+            if fw > 0:
+                pygame.draw.rect(surf, ACCENT,
+                                 (bx, y, fw, 16), border_radius=3)
+            pct = f_sm.render(f"{probs[i] * 100:.0f}%", True, TEXT_COL)
+            surf.blit(pct, (bx + bar_w + 5, y + 1))
+            y += 20
+        y += 6
+
+    # Training info
+    t = f_sm.render(f"Total Steps: {agent.total_steps}", True, DIM_TEXT)
+    surf.blit(t, (px, y))
+    y += 20
+    t = f_sm.render(f"Updates: {agent.updates}", True, DIM_TEXT)
+    surf.blit(t, (px, y))
+    y += 20
+    t = f_sm.render(f"Loss: {agent.last_loss:.4f}", True, DIM_TEXT)
+    surf.blit(t, (px, y))
+
+
+def draw_controls(surf, font, mode):
+    bar_y = WIN_H - 30
+    pygame.draw.rect(surf, (20, 20, 35), (0, bar_y, WIN_W, 30))
+    labels = ["[V]isual", "[F]ast", "[S]low", "[Space]Pause", "[Q]uit"]
+    x = 10
+    for lb in labels:
+        active = ((lb.startswith("[V]") and mode == "visual")
+                  or (lb.startswith("[F]") and mode == "fast")
+                  or (lb.startswith("[S]") and mode == "slow")
+                  or (lb.startswith("[Space]") and mode == "paused"))
+        col = ACCENT if active else DIM_TEXT
+        t = font.render(lb, True, col)
+        surf.blit(t, (x, bar_y + 6))
+        x += t.get_width() + 20
+
+
+# =====================================================================
+# 7. MAIN TRAINING LOOP
+# =====================================================================
+
+def main():
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
-    pygame.display.set_caption("TRAIN & WATCH -- PPO Learning Sokoban")
+    pygame.display.set_caption("Train & Watch - PPO learns Sokoban")
     clock = pygame.time.Clock()
 
-    font     = pygame.font.SysFont("consolas,dejavusansmono,monospace", 15)
-    font_big = pygame.font.SysFont("consolas,dejavusansmono,monospace", 18, bold=True)
+    f_big = pygame.font.SysFont("consolas", 36, bold=True)
+    f_med = pygame.font.SysFont("consolas", 26)
+    f_sm = pygame.font.SysFont("consolas", 16)
+    f_overlay = pygame.font.SysFont("consolas", 48, bold=True)
+    fonts = (f_big, f_med, f_sm)
 
-    trainer = Trainer()
+    agent = PPOAgent()
+    env = SokobanEnv()
 
-    mode = "visual"   # "visual", "fast", "slow"
-    paused = False
-    last_step_time = time.time()
+    episode = 0
+    recent_solves = deque(maxlen=100)
+    recent_rewards = deque(maxlen=100)
+    recent_steps = deque(maxlen=100)
+    recent_deadlocks = deque(maxlen=100)
+    graph_data = []
+
+    mode = "visual"
     running = True
+    obs = env.reset()
+    ep_reward = 0.0
+    ep_steps = 0
+
+    phase_flash_text = None
+    phase_flash_end = 0.0
+
+    def get_stats():
+        sr = (sum(recent_solves) / max(len(recent_solves), 1)) * 100
+        ar = sum(recent_rewards) / max(len(recent_rewards), 1)
+        ast = sum(recent_steps) / max(len(recent_steps), 1)
+        dr = (sum(recent_deadlocks) / max(len(recent_deadlocks), 1)) * 100
+        return {"episode": episode, "phase": env.phase,
+                "solve_rate": sr, "avg_reward": ar,
+                "avg_steps": ast, "deadlock_rate": dr}
+
+    def check_phase():
+        nonlocal phase_flash_text, phase_flash_end
+        if len(recent_solves) < 20:
+            return
+        sr = sum(recent_solves) / len(recent_solves)
+        if env.phase == 0 and sr > 0.70:
+            env.phase = 1
+            recent_solves.clear()
+            phase_flash_text = "PHASE 2: Two Boxes!"
+            phase_flash_end = time.time() + 2.0
+        elif env.phase == 1 and sr > 0.50:
+            env.phase = 2
+            recent_solves.clear()
+            phase_flash_text = "PHASE 3: Three Boxes!"
+            phase_flash_end = time.time() + 2.0
+
+    def finish_episode(solved, deadlocked):
+        nonlocal episode
+        episode += 1
+        recent_solves.append(1 if solved else 0)
+        recent_rewards.append(ep_reward)
+        recent_steps.append(ep_steps)
+        recent_deadlocks.append(1 if deadlocked else 0)
+        if episode % 50 == 0:
+            sr = (sum(recent_solves) / max(len(recent_solves), 1)) * 100
+            graph_data.append((episode, sr))
+        check_phase()
+
+    def run_one_step():
+        nonlocal obs, ep_reward, ep_steps
+        action, log_prob, value = agent.select_action(obs)
+        next_obs, reward, done, info = env.step(action)
+        agent.store_transition(obs, action, reward, log_prob, value, done)
+        ep_reward += reward
+        ep_steps += 1
+        if done:
+            finish_episode(info.get("solved", False),
+                           info.get("deadlock", False))
+            obs = env.reset()
+            ep_reward = 0.0
+            ep_steps = 0
+            if agent.ready_to_update():
+                agent.update()
+            return True
+        else:
+            obs = next_obs
+            if agent.ready_to_update():
+                agent.update()
+            return False
 
     while running:
-        now = time.time()
-
-        # ── Event handling ────────────────────────────────────────────
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+                if event.key == pygame.K_q:
                     running = False
-                elif event.key == pygame.K_SPACE:
-                    paused = not paused
+                elif event.key == pygame.K_v:
+                    mode = "visual"
                 elif event.key == pygame.K_f:
                     mode = "fast"
                 elif event.key == pygame.K_s:
                     mode = "slow"
-                elif event.key == pygame.K_v:
-                    mode = "visual"
+                elif event.key == pygame.K_SPACE:
+                    mode = "paused" if mode != "paused" else "visual"
 
-        # ── Training tick ─────────────────────────────────────────────
-        if not paused and trainer.episode < N_EPISODES:
-            if mode == "fast":
-                for _ in range(10):
-                    if trainer.episode >= N_EPISODES:
-                        break
-                    trainer.run_episode()
+        # advance training
+        if mode == "paused":
+            pass
+        elif mode == "slow":
+            run_one_step()
+        elif mode == "visual":
+            for _ in range(300):
+                ended = run_one_step()
+                if ended:
+                    break
+        elif mode == "fast":
+            for _ in range(2000):
+                run_one_step()
 
-            elif mode == "visual":
-                trainer.run_episode()
+        # render
+        t_now = time.time()
+        pulse_t = t_now % (2 * math.pi / 3) * 3
+        screen.fill(BG)
 
-            elif mode == "slow":
-                if now - last_step_time >= SLOW_DELAY:
-                    last_step_time = now
-                    trainer.do_one_step()
+        if mode == "fast":
+            ft = f_overlay.render("FAST MODE", True, ACCENT)
+            r = ft.get_rect(center=(310, 300))
+            screen.blit(ft, r)
+            et = f_med.render(f"Episode {episode}", True, DIM_TEXT)
+            screen.blit(et, (310 - et.get_width() // 2, 350))
+        else:
+            draw_grid(screen, env.state, 10, 10, 600, 600, pulse_t)
+            pname = PHASE_CONFIG[env.phase]["name"]
+            pt = f_sm.render(pname, True, DIM_TEXT)
+            screen.blit(pt, (310 - pt.get_width() // 2, 618))
 
-        # ── Render ────────────────────────────────────────────────────
-        screen.fill(COL_BG)
+        draw_panel(screen, get_stats(), agent, obs, fonts, graph_data, pulse_t)
+        draw_controls(screen, f_sm, mode)
 
-        # Grid
-        draw_grid(screen, trainer.state, GRID_AREA)
-        pygame.draw.rect(screen, COL_GRID_LINE, GRID_AREA, 2, border_radius=4)
+        # phase flash overlay
+        if phase_flash_text and t_now < phase_flash_end:
+            overlay = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 120))
+            screen.blit(overlay, (0, 0))
+            ft = f_overlay.render(phase_flash_text, True, (80, 255, 160))
+            r = ft.get_rect(center=(WIN_W // 2, WIN_H // 2))
+            screen.blit(ft, r)
+        elif phase_flash_text and t_now >= phase_flash_end:
+            phase_flash_text = None
 
-        # Title under grid
-        title = font_big.render("PPO Agent -- Learning Sokoban", True, COL_WHITE)
-        screen.blit(
-            title,
-            (GRID_AREA.centerx - title.get_width() // 2, GRID_AREA.bottom + 8),
-        )
-
-        # Stats panel
-        draw_stats(
-            screen, font, font_big,
-            trainer.episode,
-            trainer.all_rewards,
-            trainer.all_solved,
-            trainer.deadlocks,
-            trainer.avg_steps,
-            mode,
-            paused,
-        )
-
-        # Learning curve graph
-        draw_graph(screen, font, trainer.all_solved, GRAPH_RECT)
-
-        # Action probability bars
-        draw_action_probs(screen, font, trainer.action_probs, PROBS_RECT)
+        # pause overlay
+        if mode == "paused":
+            overlay = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 100))
+            screen.blit(overlay, (0, 0))
+            pt = f_overlay.render("PAUSED", True, (255, 255, 255))
+            r = pt.get_rect(center=(WIN_W // 2, WIN_H // 2))
+            screen.blit(pt, r)
 
         pygame.display.flip()
-        clock.tick(60)
 
-    trainer.close()
+        if mode == "slow":
+            pygame.time.wait(200)
+        else:
+            clock.tick(30)
+
     pygame.quit()
 
 

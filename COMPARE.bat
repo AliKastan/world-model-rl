@@ -11,11 +11,11 @@ echo   PPO vs ThinkerAgent - Side by Side
 echo ==========================================
 echo   Watch both agents learn simultaneously!
 echo   PPO (red) = pure trial and error
-echo   Thinker (blue) = looks ahead before acting
+echo   Thinker (blue) = plans ahead before acting
 echo.
 echo   Controls:
-echo     Space = Pause/Resume
-echo     F     = Fast mode
+echo     Space = Pause / Resume
+echo     F     = Fast mode (5x speed)
 echo     S     = Slow mode
 echo     V     = Visual mode
 echo     ESC   = Quit

@@ -10,12 +10,13 @@ echo ==========================================
 echo   Watch AI Learn Sokoban from Scratch!
 echo ==========================================
 echo   The agent starts RANDOM and gets smarter.
+echo   Real PPO reinforcement learning.
 echo.
 echo   Controls:
-echo     Space = Pause/Resume
-echo     F     = Fast mode (skip visuals)
+echo     Space = Pause / Resume
+echo     F     = Fast mode (train at full speed)
 echo     S     = Slow mode (watch every step)
-echo     V     = Visual mode (normal)
+echo     V     = Visual mode (normal speed)
 echo     ESC   = Quit
 echo ==========================================
 echo.

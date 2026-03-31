@@ -1,5 +1,5 @@
 @echo off
-title RL Training - ThinkerAgent
+title RL Training - ThinkerAgent with World Model
 cd /d "%~dp0"
 
 echo Installing dependencies...
@@ -9,11 +9,11 @@ echo.
 echo ==========================================
 echo   ThinkerAgent - World Model + Planning
 echo ==========================================
-echo   PPO policy + 1-step lookahead planning.
-echo   Learns faster than pure PPO!
+echo   Learns a world model, then thinks ahead.
+echo   Should learn FASTER than pure PPO!
 echo.
 echo   Controls:
-echo     Space = Pause/Resume
+echo     Space = Pause / Resume
 echo     F     = Fast mode
 echo     S     = Slow mode
 echo     V     = Visual mode
