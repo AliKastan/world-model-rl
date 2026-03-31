@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m agents.model_based.mental_sim)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m agents.model_based.planner)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m agents.model_based.thinker_agent)",
+      "Bash(wc -l C:UserskastaProjectsThinker-RLworld-model-rl/**/*.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m training.compare --quick --episodes 200 --difficulties 1,3 --output experiments/results/quick_test --figures --report)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \"\nfrom training.compare import ComparisonExperiment\n\nexp = ComparisonExperiment\\(output_dir='experiments/results/quick_test'\\)\nresults = exp.run\\(\n    n_episodes=200,\n    difficulties=[1, 3],\n    n_seeds=1,\n    eval_interval=100,\n    test_set_size=10,\n\\)\nexp.generate_paper_figures\\(\\)\nexp.generate_markdown_report\\(\\)\nprint\\('DONE'\\)\n\")",
+      "Bash(find /c/Users/kasta/Projects/Thinker-RL/world-model-rl -type f -name *.txt -o -name *.py -o -name *.cfg -o -name *.toml)",
+      "Bash(pip install:*)",
+      "Bash(timeout 15 streamlit run dashboard/app.py --server.headless true --server.port 8502)",
+      "Bash(ls C:/Users/kasta/Projects/Thinker-RL/world-model-rl/*.py)",
+      "Bash(ls C:/Users/kasta/Projects/Thinker-RL/world-model-rl/env/*.py)",
+      "Bash(ls C:/Users/kasta/Projects/Thinker-RL/world-model-rl/agents/model_based/*.py)",
+      "Bash(dir /s /b C:UserskastaProjectsThinker-RLworld-model-rl*.py)",
+      "Bash(ls -la *.py env/*.py agents/*.py agents/model_based/*.py training/*.py dashboard/*.py)",
+      "Bash(for d:*)",
+      "Bash(do echo:*)",
+      "Read(//c/Users/kasta/Projects/Thinker-RL/world-model-rl/$d/**)",
+      "Bash(done)",
+      "Read(//c/Users/kasta/Projects/Thinker-RL//**)",
+      "Bash(git -C /c/Users/kasta/Projects/Thinker-RL/world-model-rl log --oneline -5)",
+      "Bash(ls:*)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \"\nimport ast\nwith open\\('play_game.py', encoding='utf-8'\\) as f:\n    ast.parse\\(f.read\\(\\)\\)\nprint\\('play_game.py: syntax OK'\\)\n\nfrom play_game import _parse_level, _step, _solve, _any_deadlock, LEVELS, UP, DOWN, LEFT, RIGHT\n\nfor i, level in enumerate\\(LEVELS\\):\n    state = _parse_level\\(level\\)\n    sol = _solve\\(state, max_states=200000\\)\n    if sol:\n        test = _parse_level\\(level\\)\n        for a in sol:\n            _step\\(test, a\\)\n        assert test.solved, f'Level {i+1} solution does not solve!'\n        print\\(f'  Level {i+1} \\\\\"{level[\\\\\"name\\\\\"]}\\\\\": {len\\(sol\\)} steps \\(declared: {level[\\\\\"optimal\\\\\"]}\\) -- VERIFIED'\\)\n    else:\n        print\\(f'  Level {i+1} \\\\\"{level[\\\\\"name\\\\\"]}\\\\\": no solution found in budget'\\)\n\nprint\\('play_game.py: all levels verified'\\)\n\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \"\nfrom play_game import _parse_level, _step, _solve, LEVELS\n\nfor i, level in enumerate\\(LEVELS\\):\n    state = _parse_level\\(level\\)\n    sol = _solve\\(state, max_states=300000\\)\n    if sol:\n        test = _parse_level\\(level\\)\n        for a in sol:\n            _step\\(test, a\\)\n        assert test.solved\n        print\\(f'  Level {i+1} \\\\\"{level[\\\\\"name\\\\\"]}\\\\\": BFS={len\\(sol\\)} steps -- OK'\\)\n    else:\n        print\\(f'  Level {i+1} \\\\\"{level[\\\\\"name\\\\\"]}\\\\\": NO SOLUTION'\\)\n\")"
+    ]
+  }
+}

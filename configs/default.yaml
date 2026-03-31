@@ -1,0 +1,51 @@
+env:
+  max_steps: 200
+  max_grid_size: 12
+
+ppo:
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  total_timesteps: 1000000
+
+thinker:
+  planner: "astar"
+  beam_width: 5
+  max_plan_depth: 30
+  use_perfect_model: true
+  replan_on_deviation: true
+  max_strategies: 5
+
+world_model:
+  learning_rate: 0.001
+  batch_size: 128
+  train_freq: 100
+  buffer_size: 100000
+  epochs_per_update: 10
+
+affordance:
+  pretrain_samples: 5000
+  learning_rate: 0.001
+  pretrain_epochs: 50
+
+curriculum:
+  promote_threshold: 0.8
+  demote_threshold: 0.2
+  eval_window: 100
+
+comparison:
+  n_seeds: 3
+  eval_freq: 100
+  eval_episodes: 10
+  test_set_size: 50
+
+dashboard:
+  theme: "dark"
+  fps: 30
