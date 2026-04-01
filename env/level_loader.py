@@ -204,12 +204,12 @@ def generate_level_set(
     levels = []
     specs = [
         # (count, width, height, n_boxes, min_sol, max_sol)
-        (10, 5, 5, 1, 3, 20),      # 1-10: tiny, 1 box
-        (10, 6, 6, 1, 5, 30),      # 11-20: small, 1 box
-        (10, 7, 7, 2, 6, 50),      # 21-30: medium, 2 boxes
-        (10, 7, 7, 2, 10, 70),     # 31-40: medium-hard, 2 boxes
-        (10, 8, 8, 2, 12, 90),     # 41-50: hard, 2 boxes
-        (10, 9, 9, 3, 10, 120),    # 51-60: very hard, 3 boxes
+        (10, 6, 6, 2, 3, 25),      # 1-10: tiny, 2 boxes
+        (10, 7, 7, 2, 5, 35),      # 11-20: small, 2 boxes
+        (10, 7, 7, 3, 6, 50),      # 21-30: medium, 3 boxes
+        (10, 8, 8, 3, 10, 70),     # 31-40: medium-hard, 3 boxes
+        (10, 8, 8, 4, 10, 90),     # 41-50: hard, 4 boxes
+        (10, 9, 9, 4, 12, 120),    # 51-60: very hard, 4 boxes (larger grid)
     ]
 
     seed = base_seed
@@ -246,14 +246,15 @@ def generate_rl_training_levels(
     n_levels: int = 500,
     seed: int = 1000,
 ) -> List[SokobanState]:
-    """Generate simple 1-box levels for RL training."""
+    """Generate multi-box levels for RL training."""
     levels = []
     s = seed
     while len(levels) < n_levels:
+        n_boxes = random.choice([2, 2, 2, 3])
         result = generate_training_level(
-            width=random.choice([5, 6, 7]),
-            height=random.choice([5, 6, 7]),
-            n_boxes=1, seed=s, min_solution=3, max_solution=30,
+            width=random.choice([6, 7, 8]),
+            height=random.choice([6, 7, 8]),
+            n_boxes=n_boxes, seed=s, min_solution=3, max_solution=40,
         )
         s += 1
         if result is not None:

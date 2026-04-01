@@ -179,46 +179,46 @@ class _TierSpec:
 
 _TIERS: Dict[int, _TierSpec] = {
     1: _TierSpec(
-        grid_w=5, grid_h=5, num_boxes=1, num_targets=1,
-        interior_walls_range=(0, 0), max_steps=50,
-        solver_max_states=50_000, solver_timeout=2.0,
-    ),
-    2: _TierSpec(
-        grid_w=6, grid_h=6, num_boxes=1, num_targets=1,
-        interior_walls_range=(2, 5), max_steps=80,
+        grid_w=6, grid_h=6, num_boxes=2, num_targets=2,
+        interior_walls_range=(0, 2), max_steps=50,
         solver_max_states=100_000, solver_timeout=3.0,
     ),
-    3: _TierSpec(
+    2: _TierSpec(
         grid_w=7, grid_h=7, num_boxes=2, num_targets=2,
+        interior_walls_range=(2, 5), max_steps=80,
+        solver_max_states=150_000, solver_timeout=3.0,
+    ),
+    3: _TierSpec(
+        grid_w=7, grid_h=7, num_boxes=3, num_targets=3,
         interior_walls_range=(3, 7), max_steps=100,
         solver_max_states=200_000, solver_timeout=4.0,
     ),
     4: _TierSpec(
-        grid_w=7, grid_h=7, num_boxes=2, num_targets=2,
+        grid_w=8, grid_h=8, num_boxes=3, num_targets=3,
         interior_walls_range=(5, 10), max_steps=120,
         solver_max_states=300_000, solver_timeout=5.0,
     ),
     5: _TierSpec(
-        grid_w=8, grid_h=8, num_boxes=1, num_targets=1,
+        grid_w=8, grid_h=8, num_boxes=2, num_targets=2,
         interior_walls_range=(4, 8), num_keys=1, num_doors=1,
         max_steps=120,
         solver_max_states=300_000, solver_timeout=5.0,
     ),
     6: _TierSpec(
-        grid_w=8, grid_h=8, num_boxes=2, num_targets=2,
+        grid_w=8, grid_h=8, num_boxes=3, num_targets=3,
         interior_walls_range=(3, 6), ice_tile_range=(3, 7),
         max_steps=150,
         solver_max_states=300_000, solver_timeout=5.0,
     ),
     7: _TierSpec(
-        grid_w=9, grid_h=9, num_boxes=2, num_targets=2,
+        grid_w=9, grid_h=9, num_boxes=3, num_targets=3,
         interior_walls_range=(4, 8),
         num_switches=1, num_switch_walls=1,
         max_steps=150,
         solver_max_states=400_000, solver_timeout=5.0,
     ),
     8: _TierSpec(
-        grid_w=10, grid_h=10, num_boxes=2, num_targets=2,
+        grid_w=10, grid_h=10, num_boxes=3, num_targets=3,
         interior_walls_range=(5, 10),
         num_keys=1, num_doors=1,
         ice_tile_range=(2, 5),
@@ -227,12 +227,12 @@ _TIERS: Dict[int, _TierSpec] = {
         solver_max_states=500_000, solver_timeout=5.0,
     ),
     9: _TierSpec(
-        grid_w=10, grid_h=10, num_boxes=3, num_targets=3,
+        grid_w=10, grid_h=10, num_boxes=4, num_targets=4,
         interior_walls_range=(6, 12), max_steps=200,
         solver_max_states=500_000, solver_timeout=5.0,
     ),
     10: _TierSpec(
-        grid_w=12, grid_h=12, num_boxes=3, num_targets=3,
+        grid_w=12, grid_h=12, num_boxes=4, num_targets=4,
         interior_walls_range=(8, 16),
         num_keys=1, num_doors=1,
         ice_tile_range=(2, 5),
