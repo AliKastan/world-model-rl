@@ -27,7 +27,7 @@ class SokobanNet(nn.Module):
     Output: action_probs (B, 4), value (B, 1).
     """
 
-    def __init__(self, grid_h: int = 10, grid_w: int = 10) -> None:
+    def __init__(self, grid_h: int = 12, grid_w: int = 12) -> None:
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(5, 32, 3, padding=1), nn.ReLU(),
@@ -68,8 +68,8 @@ class PPOAgent:
 
     def __init__(
         self,
-        grid_h: int = 10,
-        grid_w: int = 10,
+        grid_h: int = 12,
+        grid_w: int = 12,
         lr: float = 2.5e-4,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -104,6 +104,7 @@ class PPOAgent:
         self.log_probs: List[float] = []
         self.values: List[float] = []
         self.dones: List[bool] = []
+        self.memory = self  # allow agent.memory.store() calls
 
     def select_action(self, obs: np.ndarray) -> Tuple[int, float, float]:
         """Sample action from policy. Returns (action, log_prob, value)."""
@@ -131,6 +132,9 @@ class PPOAgent:
         self.log_probs.append(log_prob)
         self.values.append(value)
         self.dones.append(done)
+
+    def store(self, state, action, reward, log_prob, value, done):
+        self.store_transition(state, action, reward, log_prob, value, done)
 
     def update(self) -> Dict[str, float]:
         """PPO update on collected rollout data."""

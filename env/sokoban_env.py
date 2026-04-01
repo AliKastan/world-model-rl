@@ -38,15 +38,17 @@ class SokobanEnv(gym.Env):
     def __init__(
         self,
         level_set: str = "training",
-        max_h: int = 10,
-        max_w: int = 10,
+        max_h: int = 12,
+        max_w: int = 12,
         max_steps: int = 200,
+        n_boxes: int = 1,
     ) -> None:
         super().__init__()
         self.max_h = max_h
         self.max_w = max_w
         self.max_steps = max_steps
         self.level_set = level_set
+        self.n_boxes = n_boxes
 
         # Load levels
         if level_set == "training":
@@ -81,14 +83,18 @@ class SokobanEnv(gym.Env):
             self._gen_seed = seed
 
         if self._training_params:
-            # Generate a random simple level
+            # Generate a random solvable level scaled by n_boxes
             result = None
+            nb = self.n_boxes
+            grid_min = 5 + nb  # scale grid with complexity
+            grid_max = min(grid_min + 2, self.max_h - 1)
+            max_sol = 20 + nb * 25
             while result is None:
-                w = random.choice([5, 6, 7])
-                h = random.choice([5, 6, 7])
+                w = random.choice(range(grid_min, grid_max + 1))
+                h = random.choice(range(grid_min, grid_max + 1))
                 result = generate_training_level(
-                    width=w, height=h, n_boxes=1,
-                    seed=self._gen_seed, min_solution=3, max_solution=30,
+                    width=w, height=h, n_boxes=nb,
+                    seed=self._gen_seed, min_solution=3, max_solution=max_sol,
                 )
                 self._gen_seed += 1
             self._state = result[0]
