@@ -169,40 +169,46 @@ def run_solver_mode(levels: List[SokobanState], renderer: SokobanRenderer) -> No
 def run_rl_mode(levels: List[SokobanState], renderer: SokobanRenderer,
                 model_path: str) -> None:
     """Watch trained PPO agent play Sokoban."""
-    from agents.model_free.ppo_agent import PPOAgent
-    from env.sokoban_env import SokobanEnv
+    from TRAIN_AND_WATCH import SokobanNet, SokobanRLEnv, MAX_GRID
+    import torch
+    from torch.distributions import Categorical
 
-    # Load trained agent
-    agent = PPOAgent(grid_h=12, grid_w=12)
+    # Load trained network
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = SokobanNet().to(device)
+
     if os.path.exists(model_path):
-        agent.load(model_path)
+        data = torch.load(model_path, map_location=device, weights_only=True)
+        net.load_state_dict(data["net"])
+        net.eval()
         print(f"  Loaded model from {model_path}")
     else:
         print(f"  WARNING: No model at {model_path}, using untrained agent")
-        print(f"  Run 'python TRAIN.py' first to train a model!")
+        print(f"  Run 'python TRAIN_AND_WATCH.py' first to train!")
+
+    env = SokobanRLEnv(levels, max_steps=300)
 
     total = len(levels)
     level_idx = 0
     speed_idx = 4  # 0.7s
 
-    # Env for observation generation
-    env = SokobanEnv(level_set="classic", max_h=12, max_w=12, max_steps=300)
-
     def load_level(idx: int):
-        nonlocal level_idx, state, step, solved, danger, obs
+        nonlocal level_idx, state, step, solved, danger, failed, obs
         level_idx = idx % total
-        obs, _ = env.reset(options={"level": level_idx})
-        state = env.state.clone()
+        obs = env.reset(level_idx=level_idx)
+        state = env.get_render_state()
         print(f"\n  Level {level_idx + 1}/{total}  "
               f"({state.width}x{state.height}, {len(state.boxes)} boxes)")
         step = 0
         solved = False
+        failed = False
         danger = get_danger_zones(state)
 
     state = levels[0].clone()
-    obs = np.zeros((5, 12, 12), dtype=np.float32)
+    obs = np.zeros((5, MAX_GRID, MAX_GRID), dtype=np.float32)
     step = 0
     solved = False
+    failed = False
     danger: List[Tuple[int, int]] = []
 
     load_level(0)
@@ -235,24 +241,28 @@ def run_rl_mode(levels: List[SokobanState], renderer: SokobanRenderer,
         now = time.time()
         delay = SPEED_PRESETS[speed_idx]
 
-        if not paused and not solved and step < max_steps and (now - last_step) >= delay:
+        if not paused and not solved and not failed and step < max_steps and (now - last_step) >= delay:
             last_step = now
 
-            action, _, _ = agent.select_action(obs)
-            obs, reward, terminated, truncated, info = env.step(action)
-            state = env.state.clone()
+            state_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+            with torch.no_grad():
+                probs, value = net(state_t)
+            action = probs.argmax(dim=-1).item()  # greedy at inference
+
+            obs, reward, done, info = env.step(action)
+            state = env.get_render_state()
             step += 1
             danger = get_danger_zones(state)
 
-            if state.solved:
+            if info.get("solved"):
                 solved = True
                 print(f"  SOLVED in {step} moves!")
-            elif terminated or truncated:
+            elif done:
                 reason = "deadlock" if info.get("deadlock") else "timeout"
                 print(f"  Failed ({reason}) after {step} moves")
-                solved = True  # move on
+                failed = True
 
-        if solved and (now - last_step) > 2.5:
+        if (solved or failed) and (now - last_step) > 2.5:
             load_level(level_idx + 1)
             last_step = time.time()
 
@@ -261,12 +271,12 @@ def run_rl_mode(levels: List[SokobanState], renderer: SokobanRenderer,
             level_num=level_idx + 1,
             total_levels=total,
             moves=step,
-            solved=solved and state.solved,
+            solved=solved,
             ai_mode=True,
             step_num=step,
             max_steps=max_steps,
             danger_zones=danger,
-            info_text="RL Agent | Space: Pause  S/F: Speed  N/P: Level  ESC: Quit",
+            info_text="RL Agent (PPO) | Space: Pause  S/F: Speed  N/P: Level  ESC: Quit",
         )
 
 
@@ -274,7 +284,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Watch AI solve Sokoban")
     parser.add_argument("--rl", action="store_true",
                         help="Use trained RL agent instead of BFS solver")
-    parser.add_argument("--model", type=str, default="checkpoints/ppo_final.pt",
+    parser.add_argument("--model", type=str, default="checkpoints/ppo_sokoban_60.pt",
                         help="Path to trained model (for --rl mode)")
     args = parser.parse_args()
 

@@ -1,7 +1,16 @@
 """
-Real PPO Reinforcement Learning for Sokoban.
-The agent starts knowing NOTHING and learns through trial and error.
-Watch the learning curve go from 0% to 60%+ over thousands of episodes.
+Real PPO Reinforcement Learning for Sokoban — 60 Levels with Curriculum.
+
+The agent starts knowing NOTHING and learns through trial and error
+on the actual 60 Sokoban levels. Curriculum learning unlocks harder
+levels as the agent improves.
+
+Controls:
+  Space  - Pause / Resume
+  F      - Fast mode (200 steps/frame, no rendering delay)
+  S      - Slow mode (1 step/frame, 200ms delay)
+  V      - Visual mode (3 steps/frame, normal)
+  ESC    - Quit and save checkpoint
 """
 
 import pygame
@@ -13,446 +22,162 @@ from torch.distributions import Categorical
 import numpy as np
 import random
 import os
-import json
 import sys
-from collections import deque
 import time
 import math
+from collections import deque
+from typing import List, Optional, Tuple, Dict
+
+from env.sokoban import SokobanState, solve, DIR_DELTAS
+from env.level_loader import LevelLoader
+
 
 # ============================================================
-# SOKOBAN ENVIRONMENT — Simple training levels
+# SOKOBAN GYM WRAPPER — Wraps SokobanState for RL training
 # ============================================================
 
-class SokobanEnv:
+MAX_GRID = 12  # pad all observations to 12x12
+
+class SokobanRLEnv:
     """
-    Sokoban environment for RL training.
+    Gym-like wrapper around SokobanState for RL training.
 
-    IMPORTANT: We do NOT use the classic 60 levels for training.
-    Classic levels have 6-10 boxes and require 100+ optimal moves.
-    That is WAY too hard for RL from scratch.
-
-    Instead, we generate simple training levels:
-    Phase 1: 5x5-6x6 grid, 1 box, 1 target
-    Phase 2: 6x6-7x7 grid, 2 boxes, 2 targets
-    Phase 3: 7x7-8x8 grid, 3 boxes, 3 targets
+    Loads actual levels from classic_60.txt.
+    Provides 5-channel observations and shaped rewards.
     """
 
-    UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
-    MOVES = {0: (-1, 0), 1: (1, 0), 2: (0, -1), 3: (0, 1)}  # row, col
-
-    FLOOR, WALL, BOX, TARGET, BOX_ON_TARGET, PLAYER, PLAYER_ON_TARGET = 0, 1, 2, 3, 4, 5, 6
-
-    def __init__(self, phase=1):
-        self.phase = phase
-        self.max_steps = {1: 120, 2: 200, 3: 300}[phase]
-        self.levels = self._generate_levels(phase)
+    def __init__(self, levels: List[SokobanState], max_steps: int = 200):
+        self.levels = levels
+        self.max_steps = max_steps
+        self.state: Optional[SokobanState] = None
+        self.initial_state: Optional[SokobanState] = None
+        self.steps = 0
         self.current_level_idx = 0
-        self.grid = None
-        self.player_pos = None  # (row, col)
-        self.steps = 0
-        self.num_boxes = {1: 1, 2: 2, 3: 3}[phase]
-        self.grid_size = {1: 6, 2: 7, 3: 8}[phase]  # padded size for neural network
-        self.reset()
+        self._prev_box_dist = 0.0
 
-    def _generate_levels(self, phase):
-        """
-        Generate solvable Sokoban levels.
-
-        Algorithm for 1-box levels:
-        1. Create NxN grid with walls on border
-        2. Place target at random interior position
-        3. Place box at random interior position (not on target, not in corner)
-        4. Place player at random interior position (not on box or target)
-        5. Check solvability with BFS (state = player_pos + box_pos)
-        6. If not solvable, try again
-
-        For 2-box and 3-box: same but with multiple boxes/targets.
-        BFS state = player_pos + frozenset(box_positions)
-        """
-        levels = []
-        configs = {
-            1: {"min_size": 5, "max_size": 6, "boxes": 1, "walls": 1, "count": 200},
-            2: {"min_size": 6, "max_size": 7, "boxes": 2, "walls": 2, "count": 150},
-            3: {"min_size": 7, "max_size": 8, "boxes": 3, "walls": 3, "count": 100},
-        }
-        cfg = configs[phase]
-
-        attempts = 0
-        max_attempts = cfg["count"] * 200  # don't loop forever
-
-        while len(levels) < cfg["count"] and attempts < max_attempts:
-            attempts += 1
-            size = random.randint(cfg["min_size"], cfg["max_size"])
-            level = self._try_generate_one(size, cfg["boxes"], cfg["walls"])
-            if level is not None:
-                levels.append(level)
-                if len(levels) % 20 == 0:
-                    print(f"  Phase {phase}: generated {len(levels)}/{cfg['count']} levels...")
-
-        if len(levels) < 10:
-            # Fallback: generate trivial levels
-            for _ in range(50):
-                size = cfg["min_size"]
-                grid = [[self.WALL if r == 0 or c == 0 or r == size-1 or c == size-1 else self.FLOOR
-                         for c in range(size)] for r in range(size)]
-                # Place 1 box and 1 target in straightforward position
-                grid[2][2] = self.TARGET
-                grid[2][3] = self.BOX
-                player = (3, 3)
-                levels.append({"grid": grid, "player": player, "size": size})
-
-        print(f"  Phase {phase}: {len(levels)} levels ready!")
-        return levels
-
-    def _try_generate_one(self, size, num_boxes, num_interior_walls):
-        """Try to generate one solvable level. Return None if failed."""
-        # Create empty grid with border walls
-        grid = [[self.WALL if r == 0 or c == 0 or r == size-1 or c == size-1 else self.FLOOR
-                 for c in range(size)] for r in range(size)]
-
-        # Get all interior positions
-        interior = [(r, c) for r in range(1, size-1) for c in range(1, size-1)]
-        random.shuffle(interior)
-
-        # Add some interior walls (but not too many)
-        walls_placed = 0
-        wall_positions = []
-        for pos in interior[:num_interior_walls * 3]:  # try more than needed
-            if walls_placed >= num_interior_walls:
-                break
-            r, c = pos
-            # Don't place wall if it would block too much
-            neighbors_wall = sum(1 for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]
-                               if grid[r+dr][c+dc] == self.WALL)
-            if neighbors_wall <= 1:  # at most 1 adjacent wall
-                grid[r][c] = self.WALL
-                wall_positions.append(pos)
-                walls_placed += 1
-
-        # Get remaining free positions
-        free = [(r, c) for r in range(1, size-1) for c in range(1, size-1)
-                if grid[r][c] == self.FLOOR]
-
-        if len(free) < num_boxes * 2 + 1:
-            return None
-
-        random.shuffle(free)
-
-        # Place targets
-        targets = []
-        for i in range(num_boxes):
-            pos = free.pop()
-            targets.append(pos)
-            grid[pos[0]][pos[1]] = self.TARGET
-
-        # Place boxes — avoid corners (deadlock from start)
-        boxes = []
-        for i in range(num_boxes):
-            placed = False
-            for j in range(len(free)):
-                r, c = free[j]
-                # Check not in a corner
-                adj_walls = [(grid[r-1][c] == self.WALL), (grid[r+1][c] == self.WALL),
-                             (grid[r][c-1] == self.WALL), (grid[r][c+1] == self.WALL)]
-                corner = (adj_walls[0] and adj_walls[2]) or (adj_walls[0] and adj_walls[3]) or \
-                         (adj_walls[1] and adj_walls[2]) or (adj_walls[1] and adj_walls[3])
-                if not corner and (r, c) not in targets:
-                    boxes.append(free.pop(j))
-                    placed = True
-                    break
-            if not placed:
-                return None
-
-        # Place player
-        if not free:
-            return None
-        player = free.pop()
-
-        # Mark boxes on grid (temporarily, for BFS)
-        for br, bc in boxes:
-            if grid[br][bc] == self.TARGET:
-                grid[br][bc] = self.BOX_ON_TARGET
-            else:
-                grid[br][bc] = self.BOX
-
-        # Check solvability with BFS
-        max_states = 50000 if num_boxes <= 2 else 200000
-        if not self._is_solvable(grid, player, boxes, targets, size, max_states=max_states):
-            return None
-
-        # Store the level in clean form (boxes as separate data, grid has only walls/floor/targets)
-        clean_grid = [[self.WALL if grid[r][c] == self.WALL else
-                       (self.TARGET if (r,c) in targets else self.FLOOR)
-                       for c in range(size)] for r in range(size)]
-
-        return {
-            "grid": clean_grid,
-            "player": player,
-            "boxes": list(boxes),
-            "targets": list(targets),
-            "size": size
-        }
-
-    def _is_solvable(self, grid, player, boxes, targets, size, max_states=50000):
-        """BFS solvability check."""
-        from collections import deque as bfs_deque
-
-        target_set = frozenset(targets)
-        initial_state = (player, frozenset(boxes))
-
-        visited = {initial_state}
-        queue = bfs_deque([initial_state])
-
-        while queue and len(visited) < max_states:
-            (pr, pc), box_set = queue.popleft()
-
-            # Check if solved
-            if box_set == target_set:
-                return True
-
-            for action in range(4):
-                dr, dc = self.MOVES[action]
-                nr, nc = pr + dr, pc + dc
-
-                # Out of bounds or wall
-                if nr < 0 or nr >= size or nc < 0 or nc >= size:
-                    continue
-                if grid[nr][nc] == self.WALL:
-                    continue
-
-                new_boxes = set(box_set)
-
-                if (nr, nc) in box_set:
-                    # Push box
-                    bnr, bnc = nr + dr, nc + dc
-                    if bnr < 0 or bnr >= size or bnc < 0 or bnc >= size:
-                        continue
-                    if grid[bnr][bnc] == self.WALL or (bnr, bnc) in box_set:
-                        continue
-
-                    # Check deadlock: box pushed into corner
-                    up_wall = grid[bnr-1][bnc] == self.WALL
-                    down_wall = grid[bnr+1][bnc] == self.WALL
-                    left_wall = grid[bnr][bnc-1] == self.WALL
-                    right_wall = grid[bnr][bnc+1] == self.WALL
-
-                    is_corner = (up_wall and left_wall) or (up_wall and right_wall) or \
-                                (down_wall and left_wall) or (down_wall and right_wall)
-
-                    if is_corner and (bnr, bnc) not in target_set:
-                        continue  # deadlock, prune
-
-                    new_boxes.remove((nr, nc))
-                    new_boxes.add((bnr, bnc))
-
-                new_state = ((nr, nc), frozenset(new_boxes))
-                if new_state not in visited:
-                    visited.add(new_state)
-                    queue.append(new_state)
-
-        return False
-
-    def reset(self, level_idx=None):
-        """Reset to a random (or specific) level."""
-        if level_idx is None:
-            self.current_level_idx = random.randint(0, len(self.levels) - 1)
+    def reset(self, level_idx: Optional[int] = None) -> np.ndarray:
+        """Reset to a specific or random level."""
+        if level_idx is not None:
+            self.current_level_idx = level_idx
         else:
-            self.current_level_idx = level_idx % len(self.levels)
+            self.current_level_idx = random.randint(0, len(self.levels) - 1)
 
-        level = self.levels[self.current_level_idx]
-        size = level["size"]
-
-        # Deep copy grid
-        self.grid = [row[:] for row in level["grid"]]
-        self.player_pos = level["player"]
+        self.state = self.levels[self.current_level_idx].clone()
+        self.initial_state = self.state.clone()
         self.steps = 0
-
-        # Place boxes
-        if "boxes" in level:
-            for br, bc in level["boxes"]:
-                if self.grid[br][bc] == self.TARGET:
-                    self.grid[br][bc] = self.BOX_ON_TARGET
-                else:
-                    self.grid[br][bc] = self.BOX
-
-        self._size = size
+        self._prev_box_dist = self.state.box_distances()
         return self._get_obs()
 
-    def _get_obs(self):
+    def reset_from_pool(self, pool: List[int]) -> np.ndarray:
+        """Reset to a random level from the given pool of level indices."""
+        idx = random.choice(pool)
+        return self.reset(level_idx=idx)
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, dict]:
         """
-        Return observation as 5 binary channels, padded to (5, grid_size, grid_size).
+        Execute action. Returns (obs, reward, done, info).
+
+        Reward shaping is CRITICAL for Sokoban RL:
+        - Step penalty: -0.1 (encourages efficiency)
+        - Wall bump / invalid: -1.0
+        - Box pushed to target: +10.0
+        - Box pushed off target: -10.0
+        - Box closer to target: +1.0
+        - Box farther from target: -1.0
+        - Deadlock detected: -50.0
+        - Puzzle solved: +100.0
+        """
+        reward = -0.1  # step penalty
+        info = {"solved": False, "deadlock": False, "pushed": False}
+
+        new_state = self.state.move(action)
+
+        if new_state is None:
+            # Invalid move (wall or can't push)
+            reward = -1.0
+            self.steps += 1
+            done = self.steps >= self.max_steps
+            return self._get_obs(), reward, done, info
+
+        # Check if a box was pushed
+        old_boxes = self.state.boxes
+        new_boxes = new_state.boxes
+        pushed = old_boxes != new_boxes
+
+        if pushed:
+            info["pushed"] = True
+
+            # Box on/off target rewards
+            old_on = len(old_boxes & self.state.targets)
+            new_on = len(new_boxes & new_state.targets)
+            if new_on > old_on:
+                reward += 10.0  # box placed on target
+            elif new_on < old_on:
+                reward -= 10.0  # box removed from target
+
+            # Distance-based reward shaping
+            new_dist = new_state.box_distances()
+            if new_dist < self._prev_box_dist:
+                reward += 1.0  # moved closer
+            elif new_dist > self._prev_box_dist:
+                reward -= 1.0  # moved farther
+            self._prev_box_dist = new_dist
+
+            # Deadlock check
+            if new_state.is_deadlocked():
+                reward -= 50.0
+                info["deadlock"] = True
+
+        self.state = new_state
+        self.steps += 1
+
+        # Check solved
+        if self.state.solved:
+            reward += 100.0
+            info["solved"] = True
+            return self._get_obs(), reward, True, info
+
+        done = info["deadlock"] or (self.steps >= self.max_steps)
+        return self._get_obs(), reward, done, info
+
+    def _get_obs(self) -> np.ndarray:
+        """
+        5-channel binary observation padded to (5, MAX_GRID, MAX_GRID).
 
         Channel 0: walls
         Channel 1: boxes (not on target)
-        Channel 2: targets (without box on them)
+        Channel 2: targets (without box)
         Channel 3: player
         Channel 4: boxes on target
-
-        This representation is crucial — the CNN needs spatial binary features.
         """
-        s = self.grid_size  # padded size
-        obs = np.zeros((5, s, s), dtype=np.float32)
+        obs = np.zeros((5, MAX_GRID, MAX_GRID), dtype=np.float32)
+        s = self.state
 
-        for r in range(self._size):
-            for c in range(self._size):
-                cell = self.grid[r][c]
-                if cell == self.WALL:
-                    obs[0, r, c] = 1.0
-                elif cell == self.BOX:
-                    obs[1, r, c] = 1.0
-                elif cell == self.TARGET:
-                    obs[2, r, c] = 1.0
-                elif cell == self.BOX_ON_TARGET:
-                    obs[4, r, c] = 1.0
+        for x, y in s.walls:
+            if 0 <= y < MAX_GRID and 0 <= x < MAX_GRID:
+                obs[0, y, x] = 1.0
 
-        pr, pc = self.player_pos
-        obs[3, pr, pc] = 1.0
+        for x, y in s.boxes:
+            if 0 <= y < MAX_GRID and 0 <= x < MAX_GRID:
+                if (x, y) in s.targets:
+                    obs[4, y, x] = 1.0  # box on target
+                else:
+                    obs[1, y, x] = 1.0  # box not on target
 
-        # If player is on target, also mark target channel
-        if self.grid[pr][pc] == self.TARGET or self.grid[pr][pc] == self.PLAYER_ON_TARGET:
-            obs[2, pr, pc] = 1.0
+        for x, y in s.targets:
+            if 0 <= y < MAX_GRID and 0 <= x < MAX_GRID:
+                if (x, y) not in s.boxes:
+                    obs[2, y, x] = 1.0  # empty target
+
+        px, py = s.player
+        if 0 <= py < MAX_GRID and 0 <= px < MAX_GRID:
+            obs[3, py, px] = 1.0
 
         return obs
 
-    def step(self, action):
-        """
-        Execute action and return (obs, reward, done, info).
-
-        Reward shaping is CRITICAL for Sokoban RL:
-        Without distance-based rewards, the agent only gets +100 on solve,
-        which happens so rarely that learning is essentially impossible.
-        """
-        dr, dc = self.MOVES[action]
-        pr, pc = self.player_pos
-        nr, nc = pr + dr, pc + dc
-
-        reward = -0.1  # step penalty
-        solved = False
-        deadlock = False
-        pushed = False
-
-        # Check bounds
-        if nr < 0 or nr >= self._size or nc < 0 or nc >= self._size:
-            reward = -1.0  # invalid move
-            self.steps += 1
-            done = self.steps >= self.max_steps
-            return self._get_obs(), reward, done, {"solved": False, "deadlock": False}
-
-        target_cell = self.grid[nr][nc]
-
-        if target_cell == self.WALL:
-            reward = -1.0  # bumped into wall
-
-        elif target_cell in (self.BOX, self.BOX_ON_TARGET):
-            # Try to push box
-            bnr, bnc = nr + dr, nc + dc
-
-            if (bnr < 0 or bnr >= self._size or bnc < 0 or bnc >= self._size or
-                self.grid[bnr][bnc] in (self.WALL, self.BOX, self.BOX_ON_TARGET)):
-                reward = -1.0  # can't push
-            else:
-                # Compute distance BEFORE push
-                old_box_dist = self._min_target_distance(nr, nc)
-
-                # Move box
-                box_was_on_target = (target_cell == self.BOX_ON_TARGET)
-                box_lands_on_target = (self.grid[bnr][bnc] == self.TARGET)
-
-                # Update box destination
-                if box_lands_on_target:
-                    self.grid[bnr][bnc] = self.BOX_ON_TARGET
-                    reward += 10.0  # box on target!
-                else:
-                    self.grid[bnr][bnc] = self.BOX
-
-                # Update box source
-                if box_was_on_target:
-                    self.grid[nr][nc] = self.TARGET
-                    reward -= 10.0  # box removed from target
-                else:
-                    self.grid[nr][nc] = self.FLOOR
-
-                # Move player
-                self._move_player(nr, nc)
-                pushed = True
-
-                # Distance-based reward shaping
-                new_box_dist = self._min_target_distance(bnr, bnc)
-                if new_box_dist < old_box_dist:
-                    reward += 1.0  # moved closer to target
-                elif new_box_dist > old_box_dist:
-                    reward -= 1.0  # moved further from target
-
-                # Check deadlock
-                if self._is_deadlocked(bnr, bnc):
-                    reward -= 50.0
-                    deadlock = True
-
-                # Check solved
-                if self._is_solved():
-                    reward += 100.0
-                    solved = True
-
-        elif target_cell in (self.FLOOR, self.TARGET):
-            # Simple move
-            self._move_player(nr, nc)
-
-        self.steps += 1
-        done = solved or deadlock or (self.steps >= self.max_steps)
-
-        return self._get_obs(), reward, done, {"solved": solved, "deadlock": deadlock, "pushed": pushed}
-
-    def _move_player(self, nr, nc):
-        """Move player to new position."""
-        pr, pc = self.player_pos
-        # Restore old cell
-        if self.grid[pr][pc] == self.PLAYER_ON_TARGET:
-            self.grid[pr][pc] = self.TARGET
-        # Don't overwrite box/target cells — player overlays
-        self.player_pos = (nr, nc)
-
-    def _min_target_distance(self, br, bc):
-        """Manhattan distance from box at (br,bc) to nearest target."""
-        min_dist = 999
-        for r in range(self._size):
-            for c in range(self._size):
-                if self.grid[r][c] in (self.TARGET, self.PLAYER_ON_TARGET):
-                    dist = abs(br - r) + abs(bc - c)
-                    min_dist = min(min_dist, dist)
-        # Also check BOX_ON_TARGET positions as occupied targets
-        return min_dist
-
-    def _is_deadlocked(self, br, bc):
-        """Check if box at (br,bc) is stuck in a corner (not on target)."""
-        if self.grid[br][bc] == self.BOX_ON_TARGET:
-            return False  # on target, fine
-
-        up = self.grid[br-1][bc] == self.WALL if br > 0 else True
-        down = self.grid[br+1][bc] == self.WALL if br < self._size-1 else True
-        left = self.grid[br][bc-1] == self.WALL if bc > 0 else True
-        right = self.grid[br][bc+1] == self.WALL if bc < self._size-1 else True
-
-        return (up and left) or (up and right) or (down and left) or (down and right)
-
-    def _is_solved(self):
-        """Check if all boxes are on targets."""
-        for r in range(self._size):
-            for c in range(self._size):
-                if self.grid[r][c] == self.BOX:  # box NOT on target
-                    return False
-                if self.grid[r][c] == self.TARGET:  # target without box
-                    return False
-        return True
-
-    def get_render_data(self):
-        """Return data needed for PyGame rendering."""
-        return {
-            "grid": [row[:] for row in self.grid],
-            "player_pos": self.player_pos,
-            "size": self._size,
-            "steps": self.steps,
-            "max_steps": self.max_steps,
-        }
+    def get_render_state(self) -> SokobanState:
+        """Return current state for rendering."""
+        return self.state
 
 
 # ============================================================
@@ -463,112 +188,115 @@ class SokobanNet(nn.Module):
     """
     Convolutional neural network for Sokoban.
 
-    Input: (batch, 5, grid_size, grid_size) — 5 binary channels
+    Input: (batch, 5, 12, 12) — 5 binary channels padded to 12x12
     Output: action_probs (batch, 4), value (batch, 1)
 
-    THIS is what learns. At the start, it outputs random probabilities.
-    After thousands of episodes of training, it learns to output good actions.
+    THIS is what learns. Starts with random weights → random actions.
+    After thousands of episodes, outputs good actions.
     """
 
-    def __init__(self, grid_size):
+    def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(5, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.conv = nn.Sequential(
+            nn.Conv2d(5, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
 
-        flat_size = 64 * grid_size * grid_size
+        flat_size = 64 * MAX_GRID * MAX_GRID  # 64 * 12 * 12 = 9216
 
-        self.fc = nn.Linear(flat_size, 256)
-        self.policy_head = nn.Linear(256, 4)
-        self.value_head = nn.Linear(256, 1)
+        self.fc = nn.Sequential(
+            nn.Linear(flat_size, 512),
+            nn.ReLU(),
+        )
+        self.policy_head = nn.Linear(512, 4)
+        self.value_head = nn.Linear(512, 1)
 
-        # Initialize weights with small values — IMPORTANT for stable training
-        for layer in [self.conv1, self.conv2, self.conv3, self.fc, self.policy_head, self.value_head]:
-            if hasattr(layer, 'weight'):
-                nn.init.orthogonal_(layer.weight, gain=0.01 if layer == self.policy_head else np.sqrt(2))
-                nn.init.constant_(layer.bias, 0)
+        # Orthogonal initialization for stable training
+        for module in self.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                gain = 0.01 if module is self.policy_head else np.sqrt(2)
+                nn.init.orthogonal_(module.weight, gain=gain)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
 
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.reshape(x.size(0), -1)  # flatten
-        x = F.relu(self.fc(x))
-
-        # Policy: probability distribution over 4 actions
-        action_logits = self.policy_head(x)
-        action_probs = F.softmax(action_logits, dim=-1)
-
-        # Value: estimated future reward
-        value = self.value_head(x)
-
-        return action_probs, value
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.conv(x)
+        h = h.reshape(h.size(0), -1)
+        h = self.fc(h)
+        logits = self.policy_head(h)
+        probs = F.softmax(logits, dim=-1)
+        value = self.value_head(h)
+        return probs, value
 
 
 # ============================================================
-# PPO AGENT — The actual RL algorithm
+# PPO AGENT — Real Reinforcement Learning
 # ============================================================
 
 class PPOAgent:
     """
-    Proximal Policy Optimization.
+    Proximal Policy Optimization agent.
 
     How it works:
-    1. Collect experience by running episodes (agent acts in environment)
-    2. Compute advantages (how much better was this action than average?)
-    3. Update neural network to make good actions more likely
-    4. Clip updates to prevent too-large changes (stability)
+    1. Collect experience by running episodes in the environment
+    2. Compute advantages using GAE (Generalized Advantage Estimation)
+    3. Update neural network to make good actions more likely (policy gradient)
+    4. Clip updates to prevent too-large changes (PPO stability trick)
     5. Repeat
 
     The agent starts with random weights → random actions.
-    Over time, weights update → better actions → higher rewards → better weights.
-    This is the learning loop.
+    Over time: weights update → better actions → higher rewards → better weights.
     """
 
-    def __init__(self, grid_size):
-        self.net = SokobanNet(grid_size)
-        self.optimizer = optim.Adam(self.net.parameters(), lr=2.5e-4, eps=1e-5)
+    def __init__(self, lr: float = 2.5e-4, entropy_coef: float = 0.05):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.net = SokobanNet().to(self.device)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=lr, eps=1e-5)
 
+        # PPO hyperparameters
         self.gamma = 0.99
         self.gae_lambda = 0.95
         self.clip_eps = 0.2
-        self.entropy_coef = 0.01
+        self.entropy_coef = entropy_coef  # starts high for exploration
         self.value_coef = 0.5
         self.max_grad_norm = 0.5
         self.update_epochs = 4
         self.mini_batch_size = 128
 
-        # Experience storage — cleared after each PPO update
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.log_probs = []
-        self.values = []
-        self.dones = []
+        # Experience buffer
+        self.states: List[np.ndarray] = []
+        self.actions: List[int] = []
+        self.rewards: List[float] = []
+        self.log_probs: List[float] = []
+        self.values: List[float] = []
+        self.dones: List[float] = []
 
-    def select_action(self, state_np):
+    def select_action(self, state_np: np.ndarray) -> Tuple[int, float, float, np.ndarray]:
         """
-        Given state as numpy array, return (action, log_prob, value).
+        Given observation, return (action, log_prob, value, action_probs).
 
-        CRITICAL: We SAMPLE from the probability distribution, not argmax.
-        Early training: probs ≈ [0.25, 0.25, 0.25, 0.25] → random action
-        Late training: probs ≈ [0.02, 0.05, 0.03, 0.90] → almost always RIGHT
-
-        This sampling IS the exploration mechanism.
+        We SAMPLE from the distribution (exploration), not argmax.
+        Early training: probs ~ [0.25, 0.25, 0.25, 0.25] → random
+        Late training:  probs ~ [0.02, 0.05, 0.03, 0.90] → mostly best action
         """
-        state_tensor = torch.FloatTensor(state_np).unsqueeze(0)  # (1, 5, H, W)
+        state_t = torch.FloatTensor(state_np).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            action_probs, value = self.net(state_tensor)
+            probs, value = self.net(state_t)
 
-        dist = Categorical(action_probs)
-        action = dist.sample()  # SAMPLE, not argmax!
+        dist = Categorical(probs)
+        action = dist.sample()
         log_prob = dist.log_prob(action)
 
-        return action.item(), log_prob.item(), value.item(), action_probs.squeeze().numpy()
+        return (action.item(), log_prob.item(), value.item(),
+                probs.squeeze().cpu().numpy())
 
     def store(self, state, action, reward, log_prob, value, done):
-        """Store one transition."""
+        """Store one transition in the buffer."""
         self.states.append(state.copy())
         self.actions.append(action)
         self.rewards.append(reward)
@@ -576,12 +304,12 @@ class PPOAgent:
         self.values.append(value)
         self.dones.append(done)
 
-    def update(self):
+    def update(self) -> dict:
         """
         PPO update — THE LEARNING STEP.
 
-        This is where the neural network weights actually change.
-        Called after collecting enough experience (steps_per_update transitions).
+        Called after collecting enough experience (rollout_size transitions).
+        Returns loss metrics for visualization.
         """
         if len(self.states) < 2:
             self._clear()
@@ -590,68 +318,63 @@ class PPOAgent:
         # Step 1: Compute GAE advantages
         advantages = []
         returns = []
-        gae = 0
+        gae = 0.0
 
         for t in reversed(range(len(self.rewards))):
-            if t == len(self.rewards) - 1:
-                next_value = 0
-            else:
-                next_value = self.values[t + 1]
-
+            next_value = self.values[t + 1] if t < len(self.rewards) - 1 else 0.0
             delta = self.rewards[t] + self.gamma * next_value * (1 - self.dones[t]) - self.values[t]
             gae = delta + self.gamma * self.gae_lambda * (1 - self.dones[t]) * gae
             advantages.insert(0, gae)
             returns.insert(0, gae + self.values[t])
 
         # Convert to tensors
-        states_t = torch.FloatTensor(np.array(self.states))
-        actions_t = torch.LongTensor(self.actions)
-        old_log_probs_t = torch.FloatTensor(self.log_probs)
-        advantages_t = torch.FloatTensor(advantages)
-        returns_t = torch.FloatTensor(returns)
+        states_t = torch.FloatTensor(np.array(self.states)).to(self.device)
+        actions_t = torch.LongTensor(self.actions).to(self.device)
+        old_log_probs_t = torch.FloatTensor(self.log_probs).to(self.device)
+        advantages_t = torch.FloatTensor(advantages).to(self.device)
+        returns_t = torch.FloatTensor(returns).to(self.device)
 
         # Normalize advantages
         advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
-        # Step 2: PPO update epochs
-        total_policy_loss = 0
-        total_value_loss = 0
-        total_entropy = 0
+        # Step 2: PPO epochs with mini-batches
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
         n_updates = 0
 
-        for epoch in range(self.update_epochs):
-            # Shuffle and create mini-batches
-            indices = torch.randperm(len(self.states))
+        for _ in range(self.update_epochs):
+            indices = torch.randperm(len(self.states)).to(self.device)
 
             for start in range(0, len(indices), self.mini_batch_size):
-                end = start + self.mini_batch_size
-                if end > len(indices):
-                    break
+                end = min(start + self.mini_batch_size, len(indices))
+                if end - start < 4:
+                    continue
 
-                batch_idx = indices[start:end]
+                idx = indices[start:end]
 
-                b_states = states_t[batch_idx]
-                b_actions = actions_t[batch_idx]
-                b_old_log_probs = old_log_probs_t[batch_idx]
-                b_advantages = advantages_t[batch_idx]
-                b_returns = returns_t[batch_idx]
+                b_states = states_t[idx]
+                b_actions = actions_t[idx]
+                b_old_lp = old_log_probs_t[idx]
+                b_adv = advantages_t[idx]
+                b_ret = returns_t[idx]
 
-                # Forward pass with CURRENT network (weights have been updating)
+                # Forward pass with current network
                 new_probs, new_values = self.net(b_states)
                 dist = Categorical(new_probs)
-                new_log_probs = dist.log_prob(b_actions)
+                new_lp = dist.log_prob(b_actions)
                 entropy = dist.entropy().mean()
 
                 # PPO clipped objective
-                ratio = torch.exp(new_log_probs - b_old_log_probs)
-                surr1 = ratio * b_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * b_advantages
+                ratio = torch.exp(new_lp - b_old_lp)
+                surr1 = ratio * b_adv
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * b_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 # Value loss
-                value_loss = F.mse_loss(new_values.squeeze(-1), b_returns)
+                value_loss = F.mse_loss(new_values.squeeze(-1), b_ret)
 
-                # Total loss
+                # Total loss = policy + value - entropy bonus
                 loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
 
                 # Backpropagation — THIS IS WHERE LEARNING HAPPENS
@@ -684,23 +407,176 @@ class PPOAgent:
         self.values.clear()
         self.dones.clear()
 
-    def save(self, path):
+    def save(self, path: str):
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-        torch.save({"net": self.net.state_dict(), "opt": self.optimizer.state_dict()}, path)
+        torch.save({
+            "net": self.net.state_dict(),
+            "opt": self.optimizer.state_dict(),
+        }, path)
 
-    def load(self, path):
+    def load(self, path: str):
         if os.path.exists(path):
-            data = torch.load(path, map_location="cpu")
+            data = torch.load(path, map_location=self.device, weights_only=True)
             self.net.load_state_dict(data["net"])
             self.optimizer.load_state_dict(data["opt"])
+            print(f"  Loaded checkpoint: {path}")
 
 
 # ============================================================
-# RENDERER — Beautiful Sokoban Visualization
+# CURRICULUM — Progressive level unlocking
+# ============================================================
+
+class Curriculum:
+    """
+    Manages which levels are available for training.
+
+    Tiers:
+      Tier 0: Levels 1-5   (1 box, 5x5)
+      Tier 1: Levels 6-10  (2 boxes, 6x6)
+      Tier 2: Levels 11-20 (2 boxes, 7x7)
+      Tier 3: Levels 21-30 (3 boxes, 7x7)
+      Tier 4: Levels 31-40 (3 boxes, 8x8)
+      Tier 5: Levels 41-50 (4 boxes, 8x8)
+      Tier 6: Levels 51-60 (4 boxes, 9x9)
+
+    Unlocks next tier when solve rate > threshold on current tier.
+    """
+
+    TIERS = [
+        (0, 5),    # Tier 0: levels 0-4 (1-5)
+        (5, 10),   # Tier 1: levels 5-9 (6-10)
+        (10, 20),  # Tier 2: levels 10-19 (11-20)
+        (20, 30),  # Tier 3: levels 20-29 (21-30)
+        (30, 40),  # Tier 4: levels 30-39 (31-40)
+        (40, 50),  # Tier 5: levels 40-49 (41-50)
+        (50, 60),  # Tier 6: levels 50-59 (51-60)
+    ]
+
+    TIER_NAMES = [
+        "Tier 0: Tutorial (1 box)",
+        "Tier 1: Easy (2 box, 6x6)",
+        "Tier 2: Medium (2 box, 7x7)",
+        "Tier 3: Hard (3 box, 7x7)",
+        "Tier 4: Harder (3 box, 8x8)",
+        "Tier 5: Very Hard (4 box, 8x8)",
+        "Tier 6: Expert (4 box, 9x9)",
+    ]
+
+    UNLOCK_THRESHOLD = 0.50  # 50% solve rate to unlock next tier
+
+    def __init__(self, total_levels: int = 60):
+        self.total_levels = total_levels
+        self.current_tier = 0
+        self.max_unlocked_tier = 0
+
+        # Track per-level solve stats
+        self.level_attempts: Dict[int, int] = {}
+        self.level_solves: Dict[int, int] = {}
+
+        # Recent per-tier tracking
+        self.tier_recent_solves: Dict[int, deque] = {}
+        for i in range(len(self.TIERS)):
+            self.tier_recent_solves[i] = deque(maxlen=100)
+
+    def get_available_levels(self) -> List[int]:
+        """Return list of level indices available for training."""
+        start, end = self.TIERS[0]
+        pool = list(range(start, min(end, self.total_levels)))
+
+        for tier in range(1, self.max_unlocked_tier + 1):
+            start, end = self.TIERS[tier]
+            pool.extend(range(start, min(end, self.total_levels)))
+
+        return pool
+
+    def get_weighted_pool(self) -> List[int]:
+        """
+        Return weighted level pool — harder unsolved levels sampled more.
+
+        Strategy:
+        - Levels in current tier: weight 3 (focus on frontier)
+        - Levels in previous tiers (unsolved recently): weight 2
+        - Levels in previous tiers (solved recently): weight 1
+        """
+        pool = []
+
+        for tier in range(self.max_unlocked_tier + 1):
+            start, end = self.TIERS[tier]
+            is_current = (tier == self.max_unlocked_tier)
+
+            for lvl in range(start, min(end, self.total_levels)):
+                attempts = self.level_attempts.get(lvl, 0)
+                solves = self.level_solves.get(lvl, 0)
+                solve_rate = solves / max(attempts, 1)
+
+                if is_current:
+                    weight = 3  # current frontier — high priority
+                elif solve_rate < 0.3:
+                    weight = 2  # hard unsolved from earlier tiers
+                else:
+                    weight = 1  # already mostly solved
+
+                pool.extend([lvl] * weight)
+
+        return pool if pool else [0]
+
+    def record_episode(self, level_idx: int, solved: bool):
+        """Record an episode result."""
+        self.level_attempts[level_idx] = self.level_attempts.get(level_idx, 0) + 1
+        if solved:
+            self.level_solves[level_idx] = self.level_solves.get(level_idx, 0) + 1
+
+        # Find which tier this level belongs to
+        for tier, (start, end) in enumerate(self.TIERS):
+            if start <= level_idx < end:
+                self.tier_recent_solves[tier].append(1.0 if solved else 0.0)
+                break
+
+        # Check for tier advancement
+        self._check_advance()
+
+    def _check_advance(self):
+        """Check if we should unlock the next tier."""
+        if self.max_unlocked_tier >= len(self.TIERS) - 1:
+            return  # all tiers unlocked
+
+        current = self.max_unlocked_tier
+        recent = self.tier_recent_solves[current]
+
+        if len(recent) >= 30:  # need at least 30 attempts
+            rate = sum(recent) / len(recent)
+            if rate >= self.UNLOCK_THRESHOLD:
+                self.max_unlocked_tier += 1
+
+    def get_tier_solve_rate(self, tier: int) -> float:
+        """Get recent solve rate for a tier."""
+        recent = self.tier_recent_solves.get(tier, deque())
+        if len(recent) == 0:
+            return 0.0
+        return sum(recent) / len(recent)
+
+    def get_overall_solve_rate(self) -> float:
+        """Get overall solve rate across all attempted levels."""
+        total_attempts = sum(self.level_attempts.values())
+        total_solves = sum(self.level_solves.values())
+        if total_attempts == 0:
+            return 0.0
+        return total_solves / total_attempts
+
+    def get_max_steps_for_level(self, level_idx: int) -> int:
+        """Dynamic max steps based on difficulty tier."""
+        for tier, (start, end) in enumerate(self.TIERS):
+            if start <= level_idx < end:
+                return [80, 120, 150, 200, 250, 300, 350][tier]
+        return 200
+
+
+# ============================================================
+# RENDERER — Beautiful Training Visualization
 # ============================================================
 
 class GameRenderer:
-    """Render Sokoban grid beautifully."""
+    """Render Sokoban grid and training stats."""
 
     # Colors
     BG = (18, 18, 30)
@@ -711,136 +587,154 @@ class GameRenderer:
     WALL_BOTTOM = (45, 50, 60)
     BOX_COLOR = (240, 180, 40)
     BOX_INNER = (210, 150, 30)
-    BOX_ON_TARGET_COLOR = (60, 200, 120)
+    BOX_ON_TARGET = (60, 200, 120)
     TARGET_COLOR = (52, 211, 153)
     PLAYER_COLOR = (99, 102, 241)
     TEXT_COLOR = (220, 225, 240)
     DIM_TEXT = (130, 140, 160)
     PANEL_BG = (25, 25, 40)
 
-    def __init__(self, game_area_size=550):
+    def __init__(self, game_area_size=500):
         self.game_area = game_area_size
 
-    def render_grid(self, surface, grid_data, offset_x=10, offset_y=10):
-        """Render the Sokoban grid onto a surface."""
-        grid = grid_data["grid"]
-        player = grid_data["player_pos"]
-        size = grid_data["size"]
+    def render_state(self, surface, state: SokobanState, offset_x=10, offset_y=10):
+        """Render a SokobanState onto a surface."""
+        w, h = state.width, state.height
+        cell = min(self.game_area // max(w, h), 64)
+        total_w = cell * w
+        total_h = cell * h
+        ox = offset_x + (self.game_area - total_w) // 2
+        oy = offset_y + (self.game_area - total_h) // 2
 
-        cell = min(self.game_area // size, 80)
-        total = cell * size
-        ox = offset_x + (self.game_area - total) // 2
-        oy = offset_y + (self.game_area - total) // 2
+        for y in range(h):
+            for x in range(w):
+                rx, ry = ox + x * cell, oy + y * cell
+                pos = (x, y)
+                rect = pygame.Rect(rx, ry, cell, cell)
 
-        # Draw floor
-        for r in range(size):
-            for c in range(size):
-                x, y = ox + c * cell, oy + r * cell
-                rect = pygame.Rect(x, y, cell, cell)
-
-                val = grid[r][c]
-
-                if val == SokobanEnv.WALL:
-                    pygame.draw.rect(surface, self.WALL_MAIN, rect, border_radius=cell//8)
-                    pygame.draw.line(surface, self.WALL_TOP, (x+2, y+1), (x+cell-2, y+1), 2)
-                    pygame.draw.line(surface, self.WALL_BOTTOM, (x+2, y+cell-2), (x+cell-2, y+cell-2), 2)
+                if pos in state.walls:
+                    pygame.draw.rect(surface, self.WALL_MAIN, rect, border_radius=cell // 8)
+                    pygame.draw.line(surface, self.WALL_TOP, (rx + 2, ry + 1), (rx + cell - 2, ry + 1), 2)
+                    pygame.draw.line(surface, self.WALL_BOTTOM, (rx + 2, ry + cell - 2), (rx + cell - 2, ry + cell - 2), 2)
                 else:
                     pygame.draw.rect(surface, self.FLOOR_COLOR, rect)
                     pygame.draw.rect(surface, self.GRID_LINE, rect, 1)
 
-                if val == SokobanEnv.TARGET:
-                    # Pulsing target
+                # Target
+                if pos in state.targets and pos not in state.boxes:
+                    cx, cy = rx + cell // 2, ry + cell // 2
                     pulse = 0.3 + 0.1 * math.sin(time.time() * 3)
                     tr = int(cell * pulse)
-                    cx, cy = x + cell // 2, y + cell // 2
-                    target_surf = pygame.Surface((tr*2, tr*2), pygame.SRCALPHA)
+                    target_surf = pygame.Surface((tr * 2, tr * 2), pygame.SRCALPHA)
                     pygame.draw.circle(target_surf, (*self.TARGET_COLOR, 80), (tr, tr), tr)
                     surface.blit(target_surf, (cx - tr, cy - tr))
                     pygame.draw.circle(surface, self.TARGET_COLOR, (cx, cy), max(cell // 8, 3))
 
-                elif val == SokobanEnv.BOX:
-                    inner = pygame.Rect(x + 3, y + 3, cell - 6, cell - 6)
-                    pygame.draw.rect(surface, self.BOX_COLOR, inner, border_radius=cell//5)
-                    pygame.draw.rect(surface, self.BOX_INNER, inner.inflate(-4, -4), border_radius=cell//6)
-                    # X mark
-                    m = cell // 4
-                    pygame.draw.line(surface, (200, 140, 20), (x+m, y+m), (x+cell-m, y+cell-m), 2)
-                    pygame.draw.line(surface, (200, 140, 20), (x+cell-m, y+m), (x+m, y+cell-m), 2)
+                # Box
+                if pos in state.boxes:
+                    on_target = pos in state.targets
+                    inner = pygame.Rect(rx + 3, ry + 3, cell - 6, cell - 6)
 
-                elif val == SokobanEnv.BOX_ON_TARGET:
-                    # Green glow
-                    glow_surf = pygame.Surface((cell+8, cell+8), pygame.SRCALPHA)
-                    pygame.draw.rect(glow_surf, (60, 200, 120, 40),
-                                   pygame.Rect(0, 0, cell+8, cell+8), border_radius=cell//4)
-                    surface.blit(glow_surf, (x-4, y-4))
-                    # Green box
-                    inner = pygame.Rect(x + 3, y + 3, cell - 6, cell - 6)
-                    pygame.draw.rect(surface, self.BOX_ON_TARGET_COLOR, inner, border_radius=cell//5)
-                    # Checkmark
-                    m = cell // 3
-                    pygame.draw.line(surface, (30, 140, 70), (x+m, y+cell//2), (x+cell//2, y+cell-m), 3)
-                    pygame.draw.line(surface, (30, 140, 70), (x+cell//2, y+cell-m), (x+cell-m, y+m), 3)
+                    if on_target:
+                        # Green glow
+                        glow = pygame.Surface((cell + 8, cell + 8), pygame.SRCALPHA)
+                        pygame.draw.rect(glow, (60, 200, 120, 40),
+                                         pygame.Rect(0, 0, cell + 8, cell + 8), border_radius=cell // 4)
+                        surface.blit(glow, (rx - 4, ry - 4))
+                        pygame.draw.rect(surface, self.BOX_ON_TARGET, inner, border_radius=cell // 5)
+                        # Checkmark
+                        m = cell // 3
+                        pygame.draw.line(surface, (30, 140, 70),
+                                         (rx + m, ry + cell // 2), (rx + cell // 2, ry + cell - m), 3)
+                        pygame.draw.line(surface, (30, 140, 70),
+                                         (rx + cell // 2, ry + cell - m), (rx + cell - m, ry + m), 3)
+                    else:
+                        pygame.draw.rect(surface, self.BOX_COLOR, inner, border_radius=cell // 5)
+                        pygame.draw.rect(surface, self.BOX_INNER, inner.inflate(-4, -4), border_radius=cell // 6)
+                        m = cell // 4
+                        pygame.draw.line(surface, (200, 140, 20),
+                                         (rx + m, ry + m), (rx + cell - m, ry + cell - m), 2)
+                        pygame.draw.line(surface, (200, 140, 20),
+                                         (rx + cell - m, ry + m), (rx + m, ry + cell - m), 2)
 
-        # Draw player
-        pr, pc = player
-        px = ox + pc * cell + cell // 2
-        py = oy + pr * cell + cell // 2
+        # Player
+        px, py = state.player
+        cx = ox + px * cell + cell // 2
+        cy = oy + py * cell + cell // 2
         radius = int(cell * 0.35)
-        pygame.draw.circle(surface, self.PLAYER_COLOR, (px, py), radius)
-        # Eyes (simple white dots)
+        pygame.draw.circle(surface, (70, 80, 200), (cx + 1, cy + 1), radius)
+        pygame.draw.circle(surface, self.PLAYER_COLOR, (cx, cy), radius)
         eye_r = max(cell // 12, 2)
-        pygame.draw.circle(surface, (255, 255, 255), (px - eye_r*2, py - eye_r), eye_r)
-        pygame.draw.circle(surface, (255, 255, 255), (px + eye_r*2, py - eye_r), eye_r)
+        pygame.draw.circle(surface, (255, 255, 255), (cx - eye_r * 2, cy - eye_r), eye_r)
+        pygame.draw.circle(surface, (255, 255, 255), (cx + eye_r * 2, cy - eye_r), eye_r)
 
 
 # ============================================================
-# MAIN TRAINING VISUALIZATION
+# MAIN — Training + Visualization
 # ============================================================
 
 class TrainAndWatch:
     def __init__(self):
         pygame.init()
-        self.W, self.H = 1000, 700
+        self.W, self.H = 1050, 750
         self.screen = pygame.display.set_mode((self.W, self.H))
-        pygame.display.set_caption("Real RL - Watch AI Learn Sokoban From Scratch")
+        pygame.display.set_caption("Real RL — Sokoban 60 Levels (PPO + Curriculum)")
         self.clock = pygame.time.Clock()
+
+        # Fonts
         self.font_large = pygame.font.SysFont("consolas", 28, bold=True)
         self.font_med = pygame.font.SysFont("consolas", 20)
         self.font_small = pygame.font.SysFont("consolas", 14)
         self.font_tiny = pygame.font.SysFont("consolas", 11)
 
+        # Load real levels
+        levels_path = os.path.join(os.path.dirname(__file__), "levels", "classic_60.txt")
+        loader = LevelLoader(levels_path)
+        self.all_levels = [loader.get_level(i) for i in range(loader.get_total_levels())]
+        print(f"  Loaded {len(self.all_levels)} levels from classic_60.txt")
+
         # RL components
-        self.phase = 1
-        self.env = SokobanEnv(phase=self.phase)
-        self.agent = PPOAgent(grid_size=self.env.grid_size)
-        self.renderer = GameRenderer(game_area_size=550)
+        self.env = SokobanRLEnv(self.all_levels, max_steps=200)
+        self.agent = PPOAgent(lr=2.5e-4, entropy_coef=0.05)
+        self.curriculum = Curriculum(total_levels=len(self.all_levels))
+        self.renderer = GameRenderer(game_area_size=500)
+
+        # Try to load existing checkpoint
+        self.checkpoint_path = "checkpoints/ppo_sokoban_60.pt"
+        self.agent.load(self.checkpoint_path)
 
         # Metrics
         self.episode_rewards = deque(maxlen=500)
         self.episode_solved = deque(maxlen=500)
-        self.episode_deadlocks = deque(maxlen=500)
-        self.episode_steps_list = deque(maxlen=500)
         self.total_episodes = 0
         self.total_steps = 0
         self.steps_since_update = 0
-        self.steps_per_update = 512
-        self.last_losses = {}
+        self.rollout_size = 2048
+        self.last_losses: dict = {}
         self.action_probs = [0.25, 0.25, 0.25, 0.25]
 
         # Learning curve
-        self.curve_data = []
-        self.phase_changes = []
+        self.curve_data: List[Tuple[int, float]] = []
+        self.tier_change_episodes: List[int] = []
 
-        # State
-        self.mode = "visual"  # visual, fast, slow
+        # UI state
+        self.mode = "visual"
         self.paused = False
-        self.obs = self.env.reset()
-        self.episode_reward = 0
+
+        # Current episode state
+        pool = self.curriculum.get_weighted_pool()
+        self.obs = self.env.reset_from_pool(pool)
+        self.episode_reward = 0.0
         self.episode_steps = 0
 
-        # Phase up text
-        self.phase_up_text = ""
-        self.phase_up_timer = 0
+        # Entropy annealing
+        self.initial_entropy_coef = 0.05
+        self.min_entropy_coef = 0.005
+        self.entropy_anneal_episodes = 20000
+
+        # Notification
+        self.notify_text = ""
+        self.notify_timer = 0
 
     def run(self):
         running = True
@@ -868,14 +762,17 @@ class TrainAndWatch:
                     self._train_one_step()
                     pygame.time.wait(200)
                 else:
-                    for _ in range(3):
+                    for _ in range(5):
                         self._train_one_step()
 
             self._render()
             self.clock.tick(60 if self.mode != "slow" else 10)
 
         # Save on exit
-        self.agent.save(f"checkpoints/ppo_phase{self.phase}.pt")
+        self.agent.save(self.checkpoint_path)
+        print(f"\n  Saved checkpoint to {self.checkpoint_path}")
+        print(f"  Total episodes: {self.total_episodes}")
+        print(f"  Max tier unlocked: {self.curriculum.max_unlocked_tier}")
         pygame.quit()
 
     def _train_one_step(self):
@@ -892,107 +789,131 @@ class TrainAndWatch:
         self.episode_steps += 1
 
         if done:
+            solved = info.get("solved", False)
             self.episode_rewards.append(self.episode_reward)
-            self.episode_solved.append(info.get("solved", False))
-            self.episode_deadlocks.append(info.get("deadlock", False))
-            self.episode_steps_list.append(self.episode_steps)
+            self.episode_solved.append(solved)
             self.total_episodes += 1
-            self.episode_reward = 0
-            self.episode_steps = 0
-            self.obs = self.env.reset()
 
-            # Record learning curve
+            # Record in curriculum
+            old_tier = self.curriculum.max_unlocked_tier
+            self.curriculum.record_episode(self.env.current_level_idx, solved)
+            new_tier = self.curriculum.max_unlocked_tier
+
+            if new_tier > old_tier:
+                self.tier_change_episodes.append(self.total_episodes)
+                self.notify_text = f"TIER UP! {Curriculum.TIER_NAMES[new_tier]}"
+                self.notify_timer = 180
+
+            # Entropy annealing
+            progress = min(self.total_episodes / self.entropy_anneal_episodes, 1.0)
+            self.agent.entropy_coef = self.initial_entropy_coef - progress * (self.initial_entropy_coef - self.min_entropy_coef)
+
+            # Record curve data
             if self.total_episodes % 20 == 0 and len(self.episode_solved) >= 20:
                 rate = sum(list(self.episode_solved)[-100:]) / min(len(self.episode_solved), 100) * 100
                 self.curve_data.append((self.total_episodes, rate))
 
-            # Check phase advancement
-            if len(self.episode_solved) >= 100:
-                recent_rate = sum(list(self.episode_solved)[-100:]) / 100
-                if recent_rate > 0.70 and self.phase < 3:
-                    self._advance_phase()
+            # Reset with weighted level selection
+            self.episode_reward = 0.0
+            self.episode_steps = 0
+            pool = self.curriculum.get_weighted_pool()
+            self.env.max_steps = self.curriculum.get_max_steps_for_level(self.env.current_level_idx)
+            self.obs = self.env.reset_from_pool(pool)
         else:
             self.obs = next_obs
 
         # PPO update
-        if self.steps_since_update >= self.steps_per_update:
+        if self.steps_since_update >= self.rollout_size:
             self.last_losses = self.agent.update()
             self.steps_since_update = 0
 
-    def _advance_phase(self):
-        """Move to next difficulty phase."""
-        self.phase += 1
-        self.phase_up_text = f"PHASE {self.phase}: {['', 'Baby Steps', 'Two Boxes!', 'Three Boxes!'][self.phase]}"
-        self.phase_up_timer = 120  # frames
-        self.phase_changes.append(self.total_episodes)
-
-        self.env = SokobanEnv(phase=self.phase)
-        self.obs = self.env.reset()
-        self.episode_solved.clear()
-        self.episode_rewards.clear()
-
     def _render(self):
         """Full render of training visualization."""
-        self.screen.fill((18, 18, 30))
+        self.screen.fill(GameRenderer.BG)
 
         # LEFT: Game grid
-        render_data = self.env.get_render_data()
-        self.renderer.render_grid(self.screen, render_data, offset_x=15, offset_y=15)
+        state = self.env.get_render_state()
+        if state:
+            self.renderer.render_state(self.screen, state, offset_x=15, offset_y=15)
 
-        # Phase label
-        phase_names = {1: "Phase 1: Baby Steps (1 box)", 2: "Phase 2: Two Boxes", 3: "Phase 3: Three Boxes"}
-        phase_text = self.font_small.render(phase_names.get(self.phase, ""), True, (150, 160, 180))
-        self.screen.blit(phase_text, (15, 580))
+        # Level info under grid
+        lvl_idx = self.env.current_level_idx
+        boxes = len(state.boxes) if state else 0
+        on_target = state.n_boxes_on_target if state else 0
+        lvl_text = f"Level {lvl_idx + 1}/60  |  {on_target}/{boxes} boxes on target  |  Step {self.env.steps}"
+        self._text(lvl_text, 15, 530, self.font_small, GameRenderer.DIM_TEXT)
+
+        # Current tier
+        tier_name = Curriculum.TIER_NAMES[self.curriculum.max_unlocked_tier]
+        self._text(tier_name, 15, 550, self.font_small, (99, 102, 241))
 
         # RIGHT: Stats panel
-        panel_x = 600
-        pygame.draw.rect(self.screen, (25, 25, 40), pygame.Rect(panel_x, 0, 400, self.H))
+        panel_x = 560
+        pygame.draw.rect(self.screen, GameRenderer.PANEL_BG,
+                         pygame.Rect(panel_x, 0, self.W - panel_x, self.H))
 
         x = panel_x + 20
         y = 20
 
-        # Episode
-        self._text(f"Episode: {self.total_episodes:,}", x, y, self.font_large, (220, 225, 240))
-        y += 40
-        self._text(f"Total Steps: {self.total_steps:,}", x, y, self.font_small, (130, 140, 160))
-        y += 30
+        # Episode counter
+        self._text(f"Episode: {self.total_episodes:,}", x, y, self.font_large, GameRenderer.TEXT_COLOR)
+        y += 35
+        self._text(f"Steps: {self.total_steps:,}", x, y, self.font_small, GameRenderer.DIM_TEXT)
+        y += 25
 
-        # Solve rate
-        if len(self.episode_solved) > 0:
-            solve_rate = sum(self.episode_solved) / len(self.episode_solved) * 100
-        else:
-            solve_rate = 0
-
-        color = (239, 68, 68) if solve_rate < 15 else \
-                (251, 146, 60) if solve_rate < 30 else \
-                (251, 191, 36) if solve_rate < 60 else (52, 211, 153)
-
-        self._text("Solve Rate:", x, y, self.font_small, (130, 140, 160))
+        # Overall solve rate
+        overall = self.curriculum.get_overall_solve_rate() * 100
+        color = self._rate_color(overall)
+        self._text("Overall Solve Rate:", x, y, self.font_small, GameRenderer.DIM_TEXT)
         y += 20
-        self._text(f"{solve_rate:.1f}%", x, y, self.font_large, color)
+        self._text(f"{overall:.1f}%", x, y, self.font_large, color)
         y += 40
 
-        # Other stats
-        avg_reward = sum(self.episode_rewards) / max(len(self.episode_rewards), 1)
-        avg_steps = sum(self.episode_steps_list) / max(len(self.episode_steps_list), 1)
-        deadlock_rate = sum(self.episode_deadlocks) / max(len(self.episode_deadlocks), 1) * 100
+        # Per-tier solve rates
+        self._text("Tier Progress:", x, y, self.font_small, GameRenderer.DIM_TEXT)
+        y += 20
 
-        self._text(f"Avg Reward: {avg_reward:.1f}", x, y, self.font_med, (180, 190, 210))
-        y += 25
-        self._text(f"Avg Steps: {avg_steps:.0f}", x, y, self.font_med, (180, 190, 210))
-        y += 25
-        dl_color = (52, 211, 153) if deadlock_rate < 10 else (251, 191, 36) if deadlock_rate < 30 else (239, 68, 68)
-        self._text(f"Deadlock Rate: {deadlock_rate:.0f}%", x, y, self.font_med, dl_color)
-        y += 40
+        for tier in range(len(Curriculum.TIERS)):
+            start, end = Curriculum.TIERS[tier]
+            rate = self.curriculum.get_tier_solve_rate(tier) * 100
+            unlocked = tier <= self.curriculum.max_unlocked_tier
+            active = tier == self.curriculum.max_unlocked_tier
+
+            if unlocked:
+                label_color = (220, 225, 240) if active else (160, 165, 180)
+                bar_color = self._rate_color(rate)
+            else:
+                label_color = (70, 75, 90)
+                bar_color = (50, 55, 70)
+
+            # Tier label
+            prefix = ">" if active else " "
+            lock = "" if unlocked else " [locked]"
+            self._text(f"{prefix} T{tier} (L{start + 1}-{end}){lock}", x, y, self.font_tiny, label_color)
+
+            # Progress bar
+            bar_x = x + 160
+            bar_w = 200
+            bar_h = 12
+            pygame.draw.rect(self.screen, (40, 40, 55),
+                             pygame.Rect(bar_x, y + 2, bar_w, bar_h), border_radius=3)
+            if unlocked:
+                fill_w = int(bar_w * min(rate / 100, 1.0))
+                if fill_w > 0:
+                    pygame.draw.rect(self.screen, bar_color,
+                                     pygame.Rect(bar_x, y + 2, fill_w, bar_h), border_radius=3)
+                self._text(f"{rate:.0f}%", bar_x + bar_w + 8, y, self.font_tiny, bar_color)
+
+            y += 18
+
+        y += 10
 
         # Learning curve graph
-        graph_rect = pygame.Rect(panel_x + 15, y, 370, 200)
+        graph_rect = pygame.Rect(panel_x + 15, y, self.W - panel_x - 30, 170)
         pygame.draw.rect(self.screen, (30, 30, 48), graph_rect, border_radius=8)
         pygame.draw.rect(self.screen, (50, 55, 70), graph_rect, 1, border_radius=8)
+        self._text("Solve Rate (recent 100 episodes)", panel_x + 25, y + 5, self.font_tiny, (100, 110, 130))
 
-        self._text("Solve Rate (rolling 100)", panel_x + 25, y + 5, self.font_tiny, (100, 110, 130))
-
-        # Grid lines
         gy = graph_rect.y + 25
         gh = graph_rect.height - 35
         gx = graph_rect.x + 10
@@ -1003,7 +924,6 @@ class TrainAndWatch:
             pygame.draw.line(self.screen, (45, 45, 60), (gx, line_y), (gx + gw, line_y), 1)
             self._text(f"{pct}%", gx - 5, line_y - 6, self.font_tiny, (70, 80, 100))
 
-        # Plot data
         if len(self.curve_data) >= 2:
             max_ep = max(d[0] for d in self.curve_data)
             points = []
@@ -1011,9 +931,16 @@ class TrainAndWatch:
                 px = gx + int(gw * ep / max(max_ep, 1))
                 py = gy + gh - int(gh * min(rate, 100) / 100)
                 points.append((px, py))
-
             if len(points) >= 2:
                 pygame.draw.lines(self.screen, (99, 102, 241), False, points, 2)
+
+        # Tier change markers
+        if self.curve_data:
+            max_ep = max(d[0] for d in self.curve_data)
+            for ep in self.tier_change_episodes:
+                if ep <= max_ep:
+                    tx = gx + int(gw * ep / max(max_ep, 1))
+                    pygame.draw.line(self.screen, (52, 211, 153), (tx, gy), (tx, gy + gh), 1)
 
         y = graph_rect.bottom + 15
 
@@ -1021,53 +948,59 @@ class TrainAndWatch:
         self._text("Action Probabilities:", x, y, self.font_small, (100, 110, 130))
         y += 22
         labels = ["UP:", "DOWN:", "LEFT:", "RIGHT:"]
-        for i, (label, prob) in enumerate(zip(labels, self.action_probs)):
-            self._text(label, x, y, self.font_small, (130, 140, 160))
-            bar_x = x + 90
+        for label, prob in zip(labels, self.action_probs):
+            self._text(label, x, y, self.font_small, GameRenderer.DIM_TEXT)
+            bar_x = x + 80
             bar_w = 150
             bar_h = 14
-            pygame.draw.rect(self.screen, (40, 40, 55), pygame.Rect(bar_x, y+2, bar_w, bar_h), border_radius=3)
+            pygame.draw.rect(self.screen, (40, 40, 55),
+                             pygame.Rect(bar_x, y + 2, bar_w, bar_h), border_radius=3)
             fill_w = int(bar_w * prob)
             if fill_w > 0:
-                pygame.draw.rect(self.screen, (99, 102, 241), pygame.Rect(bar_x, y+2, fill_w, bar_h), border_radius=3)
+                pygame.draw.rect(self.screen, (99, 102, 241),
+                                 pygame.Rect(bar_x, y + 2, fill_w, bar_h), border_radius=3)
             self._text(f"{prob:.2f}", bar_x + bar_w + 8, y, self.font_small, (180, 190, 210))
-            y += 22
+            y += 20
 
         y += 10
 
         # Loss info
         if self.last_losses:
-            self._text(f"Policy Loss: {self.last_losses.get('policy_loss', 0):.4f}", x, y, self.font_tiny, (100, 110, 130))
+            self._text(f"Policy Loss: {self.last_losses.get('policy_loss', 0):.4f}",
+                       x, y, self.font_tiny, (100, 110, 130))
             y += 16
-            self._text(f"Value Loss: {self.last_losses.get('value_loss', 0):.4f}", x, y, self.font_tiny, (100, 110, 130))
+            self._text(f"Value Loss: {self.last_losses.get('value_loss', 0):.4f}",
+                       x, y, self.font_tiny, (100, 110, 130))
             y += 16
-            self._text(f"Entropy: {self.last_losses.get('entropy', 0):.4f}", x, y, self.font_tiny, (100, 110, 130))
+            self._text(f"Entropy: {self.last_losses.get('entropy', 0):.4f}  (coef={self.agent.entropy_coef:.4f})",
+                       x, y, self.font_tiny, (100, 110, 130))
 
-        # Mode
-        mode_text = {"visual": "VISUAL", "fast": "FAST", "slow": "SLOW"}
+        # Mode indicator
+        mode_text = {"visual": "VISUAL", "fast": "FAST (200x)", "slow": "SLOW (1x)"}
         mode_color = {"visual": (52, 211, 153), "fast": (251, 191, 36), "slow": (147, 197, 253)}
-        self._text(f"Mode: {mode_text[self.mode]}", x, self.H - 60, self.font_med, mode_color[self.mode])
+        self._text(f"Mode: {mode_text[self.mode]}", x, self.H - 55,
+                   self.font_med, mode_color[self.mode])
 
-        # Controls
-        self._text("Space=Pause  F=Fast  S=Slow  V=Visual  ESC=Quit",
+        self._text("Space=Pause  F=Fast  S=Slow  V=Visual  ESC=Quit+Save",
                    panel_x + 20, self.H - 25, self.font_tiny, (70, 80, 100))
 
-        # Phase up notification
-        if self.phase_up_timer > 0:
-            self.phase_up_timer -= 1
-            overlay = pygame.Surface((580, 100), pygame.SRCALPHA)
-            overlay.fill((18, 18, 30, 200))
-            self.screen.blit(overlay, (10, 250))
-            text = self.font_large.render(f"PHASE UP: {self.phase_up_text}", True, (99, 102, 241))
-            self.screen.blit(text, (60, 280))
+        # Tier up notification
+        if self.notify_timer > 0:
+            self.notify_timer -= 1
+            alpha = min(255, self.notify_timer * 3)
+            overlay = pygame.Surface((540, 80), pygame.SRCALPHA)
+            overlay.fill((18, 18, 30, min(200, alpha)))
+            self.screen.blit(overlay, (10, 230))
+            text = self.font_large.render(self.notify_text, True, (52, 211, 153))
+            self.screen.blit(text, (30, 250))
 
         # Pause overlay
         if self.paused:
-            overlay = pygame.Surface((580, 580), pygame.SRCALPHA)
+            overlay = pygame.Surface((540, 540), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 120))
             self.screen.blit(overlay, (10, 10))
             text = self.font_large.render("PAUSED", True, (255, 255, 255))
-            self.screen.blit(text, (220, 280))
+            self.screen.blit(text, (210, 270))
 
         pygame.display.flip()
 
@@ -1075,26 +1008,40 @@ class TrainAndWatch:
         surf = font.render(str(text), True, color)
         self.screen.blit(surf, (x, y))
 
+    def _rate_color(self, rate: float) -> Tuple[int, int, int]:
+        if rate < 15:
+            return (239, 68, 68)
+        elif rate < 30:
+            return (251, 146, 60)
+        elif rate < 60:
+            return (251, 191, 36)
+        else:
+            return (52, 211, 153)
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("  Real RL Training — Sokoban")
-    print("  The AI starts RANDOM and learns over time.")
-    print("  Be patient — real learning takes thousands")
-    print("  of episodes!")
-    print("=" * 50)
+    print("=" * 60)
+    print("  Real RL Training — Sokoban 60 Levels")
+    print("=" * 60)
     print()
-    print("Generating training levels (this may take a moment)...")
+    print("  The AI starts RANDOM and learns through trial and error")
+    print("  on 60 real Sokoban levels with curriculum learning.")
+    print()
+    print("  Algorithm: PPO (Proximal Policy Optimization)")
+    print("  Network:   CNN (3 conv layers + FC)")
+    print("  Curriculum: 7 tiers, unlocks at 50% solve rate")
+    print()
+    print("  Controls:")
+    print("    Space = Pause/Resume")
+    print("    F = Fast mode (train 200 steps/frame)")
+    print("    S = Slow mode (watch every step)")
+    print("    V = Visual mode (normal speed)")
+    print("    ESC = Quit and save checkpoint")
+    print()
 
     app = TrainAndWatch()
-
-    print("Training levels generated! Starting visualization...")
-    print()
-    print("Controls:")
-    print("  Space = Pause/Resume")
-    print("  F = Fast mode (train without rendering)")
-    print("  S = Slow mode (watch every step)")
-    print("  V = Visual mode (normal)")
-    print("  ESC = Quit and save")
-
     app.run()

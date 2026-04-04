@@ -12,7 +12,9 @@
       "Bash(pip install:*)",
       "Bash(timeout 15 streamlit run dashboard/app.py --server.headless true --server.port 8502)",
       "Bash(echo \"EXIT:$?\")",
-      "Bash(ls -1 *.bat)"
+      "Bash(ls -1 *.bat)",
+      "Bash(xargs wc:*)",
+      "Bash(ls -la /c/Users/kasta/Projects/Thinker-RL/*.py)"
     ]
   }
 }
